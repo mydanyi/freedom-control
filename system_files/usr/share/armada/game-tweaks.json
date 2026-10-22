@@ -1,0 +1,19 @@
+{
+  "global": {
+    "cores": null,
+    "fexProfile": "default",
+    "gamescopeCores": null,
+    "gamescopeNice": -20,
+    "gamescopeVulkanRealtime": true,
+    "nice": 0,
+    "scheduler": null,
+    "thunks": {
+      "Vulkan": true,
+      "GL": true,
+      "drm": true,
+      "WaylandClient": true,
+      "asound": true
+    },
+    "wineTopology": true
+  }
+}

@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""SM8850 power-profile regression tests (T01 / a1).
+
+Exercises the real config interfaces instead of grepping implementations:
+
+* the daemon's ``parse_config`` / ``apply_underclock_refs`` / ``cpu_max_target``
+  are driven through temporary copies of the factory config, with the
+  chip-level ``power-profiles-SM8850.conf`` placed next to the copy;
+* the plugin's ``parse_power`` / ``factory_power_defaults`` / ``render_power``
+  read the same fixture; only the Decky/privileged transports are stubbed, so
+  the config code itself runs unchanged.
+
+Temporary directories come from ``tempfile`` (i.e. the inherited TMPDIR).
+
+Run with the standard library only::
+
+    python3 tests/sm8850-power-test.py
+"""
+
+import configparser
+import importlib.machinery
+import importlib.util
+import json
+import shutil
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+LIB = ROOT / "system_files/usr/lib/armada"
+LIBEXEC = ROOT / "system_files/usr/libexec/armada"
+PUBLIC_PROFILES = ROOT / "system_files/usr/share/armada/power-profiles.conf"
+SM8850_PROFILES = ROOT / "system_files/usr/share/armada/power-profiles-SM8850.conf"
+GAME_TWEAKS = ROOT / "system_files/usr/share/armada/game-tweaks.json"
+BOARD_PROFILE = ROOT / "system_files/usr/lib/armada/devices/lenovo-tb323fu.conf"
+PY_MODULES = ROOT / "decky/armada-control/py_modules"
+
+# Firmware OPP lists observed on the device (kHz).
+OPP = {
+    0: [
+        384000, 537600, 691200, 787200, 883200, 998400, 1113600, 1228800,
+        1324800, 1440000, 1555200, 1670400, 1785600, 1900800, 1996800,
+        2112000, 2227200, 2361600, 2496000, 2611200, 2745600, 2899200,
+        3033600, 3187200, 3302400, 3398400, 3513600, 3628800,
+    ],
+    6: [
+        768000, 883200, 1017600, 1132800, 1267200, 1382400, 1497600, 1632000,
+        1747200, 1862400, 1977600, 2112000, 2227200, 2438400, 2668800,
+        2880000, 3129600, 3398400, 3648000, 3763200, 3859200, 3974400,
+        4070400, 4185600, 4262400, 4339200, 4396800,
+    ],
+}
+
+# Chip layer fixture: governor policy only, so the partial-override behavior of
+# the merge is what test 1 checks.  The tier values match the design contract.
+CHIP_FIXTURE = """\
+[profile.eco]
+cpu_governor=schedutil
+
+[profile.balanced]
+cpu_governor=schedutil
+
+[profile.performance]
+cpu_governor=performance
+
+[underclock.SM8850.large]
+cpu_max_policy0=2112000
+cpu_max_policy6=2438400
+
+[underclock.SM8850.medium]
+cpu_max_policy0=2899200
+cpu_max_policy6=3398400
+
+[underclock.SM8850.small]
+cpu_max_policy0=3187200
+cpu_max_policy6=3859200
+"""
+
+
+def load_script(name):
+    spec = importlib.util.spec_from_loader(
+        name.replace("-", "_"),
+        importlib.machinery.SourceFileLoader(
+            name.replace("-", "_"), str(LIBEXEC / name)),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_plugin_power():
+    """Import the plugin module with only the Decky transports stubbed."""
+    if str(PY_MODULES) not in sys.path:
+        sys.path.insert(0, str(PY_MODULES))
+    import armada_control  # noqa: F401  (empty package marker)
+
+    system = types.ModuleType("armada_control.system")
+    system.ENV = {}
+
+    def device_env():
+        return dict(system.ENV)
+
+    system.device_env = device_env
+
+    privileged = types.ModuleType("armada_control.privileged")
+    privileged.calls = []
+
+    def call(action, **payload):
+        privileged.calls.append((action, payload))
+        return {}
+
+    privileged.call = call
+
+    sys.modules["armada_control.system"] = system
+    sys.modules["armada_control.privileged"] = privileged
+    from armada_control import power
+
+    return power, system
+
+
+if str(LIB) not in sys.path:
+    sys.path.insert(0, str(LIB))
+
+POWERD = load_script("armada-powerd")
+PLUGIN_POWER, PLUGIN_SYSTEM = load_plugin_power()
+
+
+def plugin_soc(soc):
+    """Publish the SoC through the plugin's device_env seam."""
+    PLUGIN_SYSTEM.ENV = {"ARMADA_SOC_CLASS": soc} if soc else {}
+    if "device_env" in vars(PLUGIN_POWER):
+        # Production may use ``from .system import device_env``.
+        PLUGIN_POWER.device_env = PLUGIN_SYSTEM.device_env
+
+
+def parse_device_conf(path):
+    values = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+class DaemonConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="armada-sm8850-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.factory = self.tmp / "power-profiles.conf"
+        shutil.copyfile(PUBLIC_PROFILES, self.factory)
+        self.etc = self.tmp / "etc-power-profiles.conf"
+        self.saved = (POWERD.FACTORY_CONFIG_FILE, POWERD.CONFIG_FILE)
+        self.addCleanup(self.restore_paths)
+
+    def restore_paths(self):
+        POWERD.FACTORY_CONFIG_FILE, POWERD.CONFIG_FILE = self.saved
+
+    def write_chip(self):
+        (self.tmp / "power-profiles-SM8850.conf").write_text(
+            CHIP_FIXTURE, encoding="utf-8")
+
+    def daemon(self, soc="SM8850", etc_text=None, factory=None):
+        if etc_text is not None:
+            self.etc.write_text(etc_text, encoding="utf-8")
+        POWERD.FACTORY_CONFIG_FILE = factory or self.factory
+        POWERD.CONFIG_FILE = self.etc
+        power = POWERD.ArmadaPower.__new__(POWERD.ArmadaPower)
+        power.env = {"ARMADA_SOC_CLASS": soc} if soc else {}
+        return power
+
+    def test_chip_layer_only_overrides_its_own_fields(self):
+        """public factory -> chip factory -> /etc, field by field."""
+        self.write_chip()
+        power = self.daemon(etc_text=(
+            "[profile.eco]\n"
+            "cpu_max=0.50\n"
+            "\n"
+            "[profile.balanced]\n"
+            "gpu_min=0.10\n"
+        ))
+        (default_profile, underclocks, fan_curves, profiles,
+         _fan, _suspend, _system) = power.parse_config()
+        eco, balanced, performance = (
+            profiles["eco"], profiles["balanced"], profiles["performance"])
+
+        self.assertEqual(default_profile, "balanced")
+        # chip layer owns the governor policy only
+        self.assertEqual(eco["cpu_governor"], "schedutil")
+        self.assertEqual(balanced["cpu_governor"], "schedutil")
+        self.assertEqual(performance["cpu_governor"], "performance")
+        # /etc still wins for the field it actually sets
+        self.assertAlmostEqual(eco["cpu_max"], 0.50)
+        self.assertAlmostEqual(balanced["gpu_min"], 0.10)
+        # fields absent from both chip and /etc keep the public factory values
+        self.assertEqual(eco["label"], "Eco")
+        self.assertEqual(eco["cpu_underclock"], "large")
+        self.assertAlmostEqual(eco["gpu_max"], 0.80)
+        self.assertEqual(eco["fan_curve"], "relaxed")
+        self.assertAlmostEqual(balanced["cpu_max"], 1.0)
+        self.assertEqual(underclocks["SM8850"]["large"],
+                         {0: 2112000, 6: 2438400})
+
+    def test_non_sm8850_keeps_the_public_factory(self):
+        self.write_chip()
+        power = self.daemon(soc="SM8750")
+        (_default, underclocks, _curves, profiles,
+         _fan, _suspend, _system) = power.parse_config()
+        self.assertEqual(profiles["eco"]["cpu_governor"], "conservative")
+        self.assertEqual(profiles["balanced"]["cpu_governor"], "conservative")
+        self.assertEqual(profiles["performance"]["cpu_governor"], "performance")
+        self.assertEqual(underclocks["SM8750"]["large"],
+                         {0: 1785600, 6: 1958400})
+        self.assertNotIn("SM8850", underclocks)
+
+    def test_missing_chip_file_keeps_the_public_factory(self):
+        # no power-profiles-SM8850.conf in this fixture directory
+        profiles = self.daemon().parse_config()[3]
+        self.assertEqual(profiles["eco"]["cpu_governor"], "conservative")
+        self.assertEqual(profiles["balanced"]["cpu_governor"], "conservative")
+
+    def test_cpu_max_cap_floors_the_policy_table(self):
+        """The lower of the per-policy tier and the cpu_max ratio wins."""
+        power = POWERD.ArmadaPower.__new__(POWERD.ArmadaPower)
+        power.env = {"ARMADA_SOC_CLASS": "SM8850"}
+        power.underclock_config = {
+            "SM8850": {"large": {0: 2112000, 6: 2438400}}}
+        settings = {
+            "cpu_max": 0.35,
+            "cpu_max_policy": {0: 2112000, 6: 2438400},
+        }
+        for policy_id, tier, expected in ((0, 2112000, 1228800),
+                                          (6, 2438400, 1497600)):
+            freqs = OPP[policy_id]
+            target = power.cpu_max_target(settings, policy_id, freqs)
+            self.assertLessEqual(target, tier)
+            self.assertLessEqual(target, int(freqs[-1] * 0.35))
+            self.assertEqual(power.choose_at_most(freqs, target), expected)
+
+    def test_none_underclock_stays_percent_limited(self):
+        power = POWERD.ArmadaPower.__new__(POWERD.ArmadaPower)
+        power.env = {"ARMADA_SOC_CLASS": "SM8850"}
+        power.underclock_config = {"SM8850": {"large": {0: 2112000}}}
+        settings = {"cpu_max": 0.65, "cpu_max_policy": {}}
+        freqs = OPP[0]
+        target = power.cpu_max_target(settings, 0, freqs)
+        self.assertLess(target, freqs[-1])
+        self.assertEqual(power.choose_at_most(freqs, target), 2227200)
+
+    def test_other_soc_keeps_table_priority(self):
+        power = POWERD.ArmadaPower.__new__(POWERD.ArmadaPower)
+        power.env = {"ARMADA_SOC_CLASS": "SM8750"}
+        power.underclock_config = {
+            "SM8750": {"medium": {0: 2227200, 6: 2246400}}}
+        settings = {
+            "cpu_max": 0.35,
+            "cpu_max_policy": {0: 2227200, 6: 2246400},
+        }
+        self.assertEqual(
+            power.cpu_max_target(settings, 0, OPP[0]), 2227200)
+        self.assertEqual(
+            power.cpu_max_target(settings, 6, OPP[6]), 2246400)
+
+    def test_factory_tiers_use_real_opp_and_are_monotonic(self):
+        self.assertTrue(SM8850_PROFILES.is_file(),
+                        f"missing chip factory file: {SM8850_PROFILES}")
+        parser = configparser.ConfigParser()
+        parser.read(SM8850_PROFILES)
+        tiers = {}
+        for level in ("large", "medium", "small"):
+            section = f"underclock.SM8850.{level}"
+            self.assertTrue(parser.has_section(section),
+                            f"missing section [{section}]")
+            for policy_id in (0, 6):
+                key = f"cpu_max_policy{policy_id}"
+                self.assertTrue(parser.has_option(section, key),
+                                f"missing {key} in [{section}]")
+                value = parser.getint(section, key)
+                self.assertIn(value, OPP[policy_id],
+                              f"{section} {key}={value} is not a device OPP")
+                tiers[(level, policy_id)] = value
+        for policy_id in (0, 6):
+            self.assertLess(tiers[("large", policy_id)],
+                            tiers[("medium", policy_id)])
+            self.assertLess(tiers[("medium", policy_id)],
+                            tiers[("small", policy_id)])
+            self.assertLessEqual(tiers[("small", policy_id)],
+                                 OPP[policy_id][-1])
+
+    def test_none_profile_uses_firmware_max(self):
+        self.assertTrue(SM8850_PROFILES.is_file(),
+                        f"missing chip factory file: {SM8850_PROFILES}")
+        chip = configparser.ConfigParser()
+        chip.read(SM8850_PROFILES)
+        if chip.has_section("profile.performance"):
+            self.assertFalse(
+                [key for key in chip.options("profile.performance")
+                 if key.startswith("cpu_max_policy")],
+                "performance must not carry a policy table")
+
+        power = self.daemon(factory=PUBLIC_PROFILES)
+        (_default, underclocks, _curves, profiles,
+         _fan, _suspend, _system) = power.parse_config()
+        performance = profiles["performance"]
+        self.assertEqual(performance["cpu_underclock"], "none")
+        self.assertEqual(performance["cpu_max_policy"], {})
+
+        power.underclock_config = underclocks
+        power.profile = "performance"
+        for policy_id in (0, 6):
+            freqs = OPP[policy_id]
+            target = power.cpu_max_target(performance, policy_id, freqs)
+            self.assertEqual(power.choose_at_most(freqs, target), freqs[-1])
+
+    def test_board_profile_primes_are_6_7(self):
+        self.assertTrue(BOARD_PROFILE.is_file())
+        values = parse_device_conf(BOARD_PROFILE)
+        self.assertEqual(values.get("ARMADA_SOC_CLASS"), "SM8850")
+        self.assertEqual(values.get("ARMADA_PRIME_CORES"), "6-7")
+        self.assertEqual(values.get("ARMADA_BIG_CORES"), "0-7")
+        self.assertEqual(values.get("ARMADA_LITTLE_CORES"), "")
+        # description metadata only: neither factory layer assigns game masks
+        global_tweaks = json.loads(GAME_TWEAKS.read_text(encoding="utf-8"))["global"]
+        self.assertIsNone(global_tweaks.get("cores"))
+        self.assertIsNone(global_tweaks.get("gamescopeCores"))
+
+
+class PluginConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="armada-sm8850-plugin-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.factory = self.tmp / "power-profiles.conf"
+        shutil.copyfile(PUBLIC_PROFILES, self.factory)
+        (self.tmp / "power-profiles-SM8850.conf").write_text(
+            CHIP_FIXTURE, encoding="utf-8")
+        self.etc = self.tmp / "etc-power-profiles.conf"
+        self.saved = (PLUGIN_POWER.FACTORY_POWER_CONFIG,
+                      PLUGIN_POWER.POWER_CONFIG)
+        self.addCleanup(self.restore)
+        PLUGIN_POWER.FACTORY_POWER_CONFIG = self.factory
+        PLUGIN_POWER.POWER_CONFIG = self.etc
+        plugin_soc("SM8850")
+
+    def restore(self):
+        PLUGIN_POWER.FACTORY_POWER_CONFIG, PLUGIN_POWER.POWER_CONFIG = self.saved
+        plugin_soc("")
+        PLUGIN_SYSTEM.ENV = {}
+
+    def write_etc(self, text):
+        self.etc.write_text(text, encoding="utf-8")
+
+    def test_effective_config_and_defaults_read_chip_layer(self):
+        data = PLUGIN_POWER.parse_power()
+        factory = PLUGIN_POWER.factory_power_defaults()
+        for parsed in (data, factory):
+            self.assertEqual(parsed["profiles"]["eco"]["cpu_governor"],
+                             "schedutil")
+            self.assertEqual(parsed["profiles"]["balanced"]["cpu_governor"],
+                             "schedutil")
+            self.assertEqual(parsed["profiles"]["performance"]["cpu_governor"],
+                             "performance")
+        # the chip layer is partial: public factory fields survive
+        self.assertEqual(data["profiles"]["eco"]["cpu_max"], "0.65")
+        self.assertEqual(data["profiles"]["eco"]["label"], "Eco")
+
+    def test_user_override_does_not_pollute_restore_defaults(self):
+        self.write_etc("[profile.eco]\ncpu_governor=performance\n")
+        self.assertEqual(
+            PLUGIN_POWER.parse_power()["profiles"]["eco"]["cpu_governor"],
+            "performance")
+        self.assertEqual(
+            PLUGIN_POWER.factory_power_defaults()["profiles"]["eco"]["cpu_governor"],
+            "schedutil")
+
+    def test_render_restores_factory_fields_and_keeps_unknown(self):
+        self.write_etc(
+            "[profile.eco]\n"
+            "cpu_governor = performance\n"
+            "cpu_max = 0.50\n"
+            "custom_extra = hand-edited\n"
+            "\n"
+            "[general]\n"
+            "vendor_note = keep\n"
+        )
+        data = PLUGIN_POWER.parse_power()
+        factory = PLUGIN_POWER.factory_power_defaults()
+        self.assertEqual(data["profiles"]["eco"]["cpu_governor"],
+                         "performance")
+
+        restored_text = PLUGIN_POWER.render_power(factory, factory)
+        self.assertNotIn("schedutil", restored_text,
+                         "factory values must not be written to /etc")
+        restored = configparser.ConfigParser()
+        restored.read_string(restored_text)
+        self.assertTrue(restored.has_section("profile.eco"))
+        self.assertFalse(restored.has_option("profile.eco", "cpu_governor"))
+        self.assertFalse(restored.has_option("profile.eco", "cpu_max"))
+        self.assertEqual(restored.get("profile.eco", "custom_extra"),
+                         "hand-edited")
+        self.assertEqual(restored.get("general", "vendor_note"), "keep")
+        self.assertFalse(restored.has_section("profile.balanced"))
+
+        edited = configparser.ConfigParser()
+        edited.read_string(PLUGIN_POWER.render_power(data, factory))
+        self.assertEqual(edited.get("profile.eco", "cpu_governor"),
+                         "performance")
+        self.assertEqual(edited.get("profile.eco", "cpu_max"), "0.50")
+        self.assertEqual(edited.get("profile.eco", "custom_extra"),
+                         "hand-edited")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
