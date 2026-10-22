@@ -12,6 +12,7 @@ import {
 } from "./lib/steamCompat";
 import { factoryDefaultTransition } from "./lib/protonPolicy";
 import { installY700FrameRateChoices } from "./lib/y700FrameRateChoices";
+import { registerSteamProfileLocalization } from "./lib/steamProfileLocalization";
 
 // Gamescope's edge swipes toggle the Steam menus, so a drag inside an open
 // side menu (a quick access slider moved toward the edge) would close it:
@@ -37,6 +38,7 @@ function watchSideMenus(): () => void {
 export default definePlugin(() => {
   let unregisterDownloadWatcher = () => {};
   let disposeFrameRateChoices = () => {};
+  const unregisterProfileLocalization = registerSteamProfileLocalization();
   const stopWatchingSideMenus = watchSideMenus();
   const persistHandledGames = () => {
     saveCompatApplied(handledGameAppids()).catch(() => {});
@@ -108,6 +110,7 @@ export default definePlugin(() => {
       cancelled = true;
       unregisterDownloadWatcher();
       disposeFrameRateChoices();
+      unregisterProfileLocalization();
       stopWatchingSideMenus();
     },
     icon: (
