@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from armada_control.calibration import (
     begin_session,
@@ -31,9 +32,45 @@ from armada_control.system import (
 from armada_control.tweaks import load_compat_applied, save_compat_applied, save_tweaks
 from armada_control.fan_curves import get_state as get_fans_state, save_all as save_fan_curves, save_charging_pwm
 from armada_control.fan_sensors import get_current_temp
+from armada_control.home_power import HomePower
+
+logger = logging.getLogger("armada-control")
 
 
 class Plugin:
+    def __init__(self):
+        self._home_power = HomePower()
+
+    async def _main(self):
+        try:
+            await asyncio.to_thread(self._home_power.sync)
+        except Exception:
+            logger.exception("Failed to apply the saved Steam UI power preference")
+
+    async def _unload(self):
+        try:
+            await asyncio.to_thread(self._home_power.restore)
+        except Exception:
+            logger.exception("Failed to restore the Steam UI refresh rate on unload")
+
+    async def _uninstall(self):
+        try:
+            await asyncio.to_thread(self._home_power.restore)
+        except Exception:
+            logger.exception("Failed to restore the Steam UI refresh rate on uninstall")
+
+    async def get_home_power(self):
+        return await asyncio.to_thread(self._home_power.get_state)
+
+    async def set_home_power(self, enabled):
+        return await asyncio.to_thread(self._home_power.set_enabled, enabled)
+
+    async def sync_home_power(self):
+        return await asyncio.to_thread(self._home_power.sync)
+
+    async def restore_home_power(self):
+        return await asyncio.to_thread(self._home_power.restore)
+
     # Offload blocking work to a thread so a slow call can't stall Decky's asyncio loop.
     async def get_config(self):
         return await asyncio.to_thread(build_config, False)

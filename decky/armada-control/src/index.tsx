@@ -1,5 +1,5 @@
 import { definePlugin } from "@decky/api";
-import { getCompatApplied, getConfig, getInstalledGames, saveCompatApplied, suspendSwipeGestures } from "./backend";
+import { getCompatApplied, getConfig, getInstalledGames, restoreHomePower, saveCompatApplied, suspendSwipeGestures, syncHomePower } from "./backend";
 import { Content } from "./Content";
 import {
   configureCompatPolicy,
@@ -36,6 +36,11 @@ function watchSideMenus(): () => void {
 }
 
 export default definePlugin(() => {
+  // Reapply the saved Steam UI preference immediately; the compatibility sweep
+  // below depends on installed games and must not delay or gate this.
+  syncHomePower().catch((error) => {
+    console.warn("[armada-control] home power sync failed", error);
+  });
   let unregisterDownloadWatcher = () => {};
   let disposeFrameRateChoices = () => {};
   const unregisterProfileLocalization = registerSteamProfileLocalization();
@@ -108,6 +113,10 @@ export default definePlugin(() => {
     content: <Content />,
     onDismount() {
       cancelled = true;
+      // Best-effort only; backend unload owns the authoritative restore.
+      restoreHomePower().catch((error) => {
+        console.warn("[armada-control] home power restore failed", error);
+      });
       unregisterDownloadWatcher();
       disposeFrameRateChoices();
       unregisterProfileLocalization();

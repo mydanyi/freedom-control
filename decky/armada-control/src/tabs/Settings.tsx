@@ -18,6 +18,7 @@ import {
   setSwipeGesturesEnabled as applySwipeGesturesEnabled,
 } from "../backend";
 import { openCalibration } from "../components/Calibration";
+import { HomePowerSetting } from "../components/HomePowerSetting";
 import { SelectEdit, SliderEdit, ToggleRow } from "../components/widgets";
 import { useDebouncedApply } from "../hooks/useDebouncedApply";
 import { t, translateLabel } from "../i18n";
@@ -187,6 +188,7 @@ export function Settings({ config, setConfig }: {
         <ButtonItem layout="below" onClick={openCalibration}>{t("calibration.launch")}</ButtonItem>
       </PanelSection>
       <PanelSection title={t("settings.system")}>
+        <HomePowerSetting />
         <ToggleRow
           label={t("settings.swipeGestures")}
           description={t("settings.swipeGesturesDescription")}

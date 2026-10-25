@@ -1,5 +1,5 @@
 import { call } from "@decky/api";
-import type { CalibrationState, CompatAppliedState, Config, CurvesState, FanCurve, FanSettings, InstalledGame, PowerConfig, RgbConfig, Tweaks } from "./types";
+import type { CalibrationState, CompatAppliedState, Config, CurvesState, FanCurve, FanSettings, HomePowerState, InstalledGame, PowerConfig, RgbConfig, Tweaks } from "./types";
 
 export const getConfig = () => call<[], Config>("get_config");
 export const getInstalledGames = () => call<[], InstalledGame[]>("get_installed_games");
@@ -59,3 +59,7 @@ export const getFansState = () => call<[], CurvesState>("get_fans_state");
 export const saveFanCurves = (fanCurves: Record<string, FanCurve>, fanSettings: FanSettings) =>
   call<[Record<string, FanCurve>, FanSettings], CurvesState>("save_fan_curves", fanCurves, fanSettings);
 export const getCurrentTemp = () => call<[], number | null>("get_current_temp");
+export const getHomePower = () => call<[], HomePowerState>("get_home_power");
+export const setHomePower = (enabled: boolean) => call<[boolean], HomePowerState>("set_home_power", enabled);
+export const syncHomePower = () => call<[], HomePowerState>("sync_home_power");
+export const restoreHomePower = () => call<[], HomePowerState>("restore_home_power");

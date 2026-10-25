@@ -85,6 +85,13 @@ export interface AbsControl {
   resolution: number;
 }
 
+export interface HomePowerState {
+  enabled: boolean;
+  supported: boolean;
+  active: boolean;
+  reason: string;
+}
+
 export interface CalibrationState {
   supported: boolean;
   reason: string;
