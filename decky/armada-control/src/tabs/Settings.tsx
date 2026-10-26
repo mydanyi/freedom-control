@@ -16,6 +16,7 @@ import {
   setSleepLogsEnabled as applySleepLogsEnabled,
   setSshEnabled as applySshEnabled,
   setSwipeGesturesEnabled as applySwipeGesturesEnabled,
+  setSwipeGesturesInGameEnabled as applySwipeGesturesInGameEnabled,
 } from "../backend";
 import { openCalibration } from "../components/Calibration";
 import { HomePowerSetting } from "../components/HomePowerSetting";
@@ -34,6 +35,7 @@ export function Settings({ config, setConfig }: {
   setConfig: Dispatch<SetStateAction<Config | null>>;
 }) {
   const [swipeGesturesSaving, setSwipeGesturesSaving] = useState(false);
+  const [swipeGesturesInGameSaving, setSwipeGesturesInGameSaving] = useState(false);
   const [sleepLogsEnabled, setSleepLogsEnabled] = useState<boolean | null>(null);
   const [sleepLogsSaving, setSleepLogsSaving] = useState(false);
   const setBottomScreenBrightness = useDebouncedApply(
@@ -117,7 +119,7 @@ export function Settings({ config, setConfig }: {
     }
   };
   const setSwipeGesturesEnabled = async (enabled: boolean) => {
-    if (swipeGesturesSaving) return;
+    if (swipeGesturesSaving || swipeGesturesInGameSaving) return;
     setSwipeGesturesSaving(true);
     try {
       const applied = await applySwipeGesturesEnabled(enabled);
@@ -126,6 +128,18 @@ export function Settings({ config, setConfig }: {
       toaster.toast({ title: t("settings.swipeGesturesError"), body: String(error) });
     } finally {
       setSwipeGesturesSaving(false);
+    }
+  };
+  const setSwipeGesturesInGameEnabled = async (enabled: boolean) => {
+    if (swipeGesturesSaving || swipeGesturesInGameSaving) return;
+    setSwipeGesturesInGameSaving(true);
+    try {
+      const applied = await applySwipeGesturesInGameEnabled(enabled);
+      setConfig((current) => (current ? { ...current, swipeGesturesInGameEnabled: applied } : current));
+    } catch (error) {
+      toaster.toast({ title: t("settings.swipeGesturesInGameError"), body: String(error) });
+    } finally {
+      setSwipeGesturesInGameSaving(false);
     }
   };
   const setBottomScreenEnabled = async (enabled: boolean) => {
@@ -193,8 +207,14 @@ export function Settings({ config, setConfig }: {
           label={t("settings.swipeGestures")}
           description={t("settings.swipeGesturesDescription")}
           value={config.swipeGesturesEnabled}
-          disabled={swipeGesturesSaving}
+          disabled={swipeGesturesSaving || swipeGesturesInGameSaving}
           onChange={setSwipeGesturesEnabled}
+        />
+        <ToggleRow
+          label={t("settings.swipeGesturesInGame")}
+          value={config.swipeGesturesInGameEnabled}
+          disabled={!config.swipeGesturesEnabled || swipeGesturesSaving || swipeGesturesInGameSaving}
+          onChange={setSwipeGesturesInGameEnabled}
         />
         <SelectEdit
           label={t("settings.sleepMode")}

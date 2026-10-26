@@ -16,6 +16,7 @@ from .system import (
     sleep_modes,
     ssh_enabled,
     swipe_gestures_enabled,
+    swipe_gestures_in_game_enabled,
 )
 from .tweaks import (
     fex_profile_labels,
@@ -60,6 +61,7 @@ def build_config(include_games=True):
         "fanSupported": fan_supported(),
         "sshEnabled": ssh_enabled(),
         "swipeGesturesEnabled": swipe_gestures_enabled(),
+        "swipeGesturesInGameEnabled": swipe_gestures_in_game_enabled(),
         "mtpEnabled": mtp_enabled(),
         "desktopMode": desktop_mode(),
         "desktopModes": desktop_modes(),

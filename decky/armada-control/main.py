@@ -27,6 +27,7 @@ from armada_control.system import (
     set_sleep_logs_enabled,
     set_ssh_enabled,
     set_swipe_gestures_enabled,
+    set_swipe_gestures_in_game_enabled,
     suspend_swipe_gestures,
 )
 from armada_control.tweaks import load_compat_applied, save_compat_applied, save_tweaks
@@ -97,6 +98,9 @@ class Plugin:
 
     async def set_swipe_gestures_enabled(self, enabled):
         return await asyncio.to_thread(set_swipe_gestures_enabled, enabled)
+
+    async def set_swipe_gestures_in_game_enabled(self, enabled):
+        return await asyncio.to_thread(set_swipe_gestures_in_game_enabled, enabled)
 
     async def suspend_swipe_gestures(self, suspended):
         return await asyncio.to_thread(suspend_swipe_gestures, suspended)

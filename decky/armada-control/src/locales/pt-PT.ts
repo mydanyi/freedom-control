@@ -55,6 +55,8 @@ export const ptPT = {
   "settings.swipeGestures": "Gestos de deslizar",
   "settings.swipeGesturesDescription": "Deslize a partir das margens do ecrã para abrir os menus do Steam.",
   "settings.swipeGesturesError": "Não foi possível alterar os gestos de deslizar",
+  "settings.swipeGesturesInGame": "Ativar gestos de deslizar nos jogos",
+  "settings.swipeGesturesInGameError": "Não foi possível alterar os gestos de deslizar nos jogos",
   "settings.enableSsh": "Ativar SSH",
   "settings.osVersion": "Versão do SO",
   "common.unknown": "desconhecido",

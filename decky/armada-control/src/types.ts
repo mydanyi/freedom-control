@@ -162,6 +162,7 @@ export interface Config {
   fanSupported: boolean;
   sshEnabled: boolean;
   swipeGesturesEnabled: boolean;
+  swipeGesturesInGameEnabled: boolean;
   mtpEnabled: boolean;
   desktopMode: string;
   desktopModes: DropdownChoice[];

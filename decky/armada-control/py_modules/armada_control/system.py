@@ -125,6 +125,17 @@ def set_swipe_gestures_enabled(enabled):
     return bool(call("set_swipe_gestures_enabled", enabled=enabled)["enabled"])
 
 
+def swipe_gestures_in_game_enabled():
+    try:
+        return bool(call("get_swipe_gestures_in_game_enabled")["enabled"])
+    except Exception:
+        return False
+
+
+def set_swipe_gestures_in_game_enabled(enabled):
+    return bool(call("set_swipe_gestures_in_game_enabled", enabled=enabled)["enabled"])
+
+
 def suspend_swipe_gestures(suspended):
     return bool(call("suspend_swipe_gestures", suspended=suspended)["suspended"])
 

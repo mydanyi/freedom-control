@@ -53,6 +53,8 @@ export const en = {
   "settings.swipeGestures": "Swipe Gestures",
   "settings.swipeGesturesDescription": "Swipe from the screen edges to open Steam menus.",
   "settings.swipeGesturesError": "Could not change swipe gestures",
+  "settings.swipeGesturesInGame": "Enable swipe gestures in games",
+  "settings.swipeGesturesInGameError": "Could not change in-game swipe gestures",
   "settings.enableSsh": "Enable SSH",
   "settings.osVersion": "OS Version",
   "common.unknown": "unknown",
