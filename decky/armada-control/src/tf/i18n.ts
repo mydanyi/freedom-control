@@ -77,6 +77,7 @@ export const en = {
   "error.layout_unsupported": "The card layout is not a supported native three-partition GPT volume. Reallocate it from Android.",
   "error.identity_mismatch": "The card identity does not match the handoff. Rescan the card.",
   "error.filesystem_mismatch": "The filesystem does not match the handoff record. Rescan the card.",
+  "error.filesystem_needs_recovery": "This ext4 card still needs journal recovery, so it was not mounted. Insert it into the device that wrote it, let it finish mounting, then rescan.",
   "error.card_busy": "The card is busy. Wait for the automount to finish, then retry.",
 } as const;
 
@@ -154,6 +155,7 @@ export const zh: Record<TranslationKey, string> = {
   "error.layout_unsupported": "该卡不是受支持的原生三分区 GPT 布局。请从 Android 重新分配。",
   "error.identity_mismatch": "TF 卡身份与交接记录不匹配，请重新扫描。",
   "error.filesystem_mismatch": "文件系统与交接记录不匹配，请重新扫描。",
+  "error.filesystem_needs_recovery": "该 ext4 卡仍需日志恢复，本次未挂载。请先在写入该卡的设备上完成挂载，然后重新扫描。",
   "error.card_busy": "TF 卡正忙，请等待自动挂载结束后重试。",
 };
 

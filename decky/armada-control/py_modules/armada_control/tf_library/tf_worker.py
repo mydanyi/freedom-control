@@ -11,7 +11,9 @@ conversion survives a Decky panel close or a plugin reload.  The worker:
 * unmounts only the reserve partition and refuses to format a busy one;
 * retypes only ``p1`` to the Linux-filesystem GPT type (``sgdisk --typecode=1:8300``)
   and re-reads the GPT to prove the Android ``p2``/``p3`` are untouched;
-* formats only the reserve partition (``mkfs.ext4 -F -E nodiscard -L ARMADA_TF_<cid6>``);
+* formats only the reserve partition (``mkfs.ext4 -F -E nodiscard -U <intended>
+  -L ARMADA_TF_<cid6>``), where the intended UUID is generated and persisted in
+  the validated checkpoint *before* anything is retyped or formatted;
 * persists a durable checkpoint before formatting and after formatting so an
   interrupted run can resume without ever reformatting a verified ext4 reserve;
 * mounts through the upstream automount helper, verifies the mount is the exact
@@ -27,14 +29,17 @@ arbitrary working directory, so it never depends on a relative import or on an
 installed ``armada_installer`` distribution.
 """
 
+import errno
 import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
 import time
 import urllib.parse
+import uuid
 from pathlib import Path
 
 if __package__ in (None, ""):  # run as a direct script by the fixed systemd unit
@@ -56,6 +61,7 @@ MARKER_NAME = tf_inspection.LINUX_MARKER_NAME
 
 _VDF_PATH = re.compile(r'"path"\s*"([^"]*)"')
 _UUID_DASH = re.compile(r"-")
+_UUID32 = re.compile(r"[0-9a-f]{32}\Z")
 
 
 class WorkerError(service.InstallerError):
@@ -74,6 +80,21 @@ def _same_source(left, right):
         return os.path.realpath(left) == os.path.realpath(right)
     except OSError:
         return left == right
+
+
+def _is_symlink_at(parent_fd, name):
+    """True when ``name`` inside ``parent_fd`` is a symlink; never follows it.
+
+    Linux may report either ``ELOOP`` or ``ENOTDIR`` when ``openat`` combines
+    ``O_DIRECTORY`` with ``O_NOFOLLOW`` and the entry is a symlink to a
+    directory, so the failed open is classified with a descriptor-relative
+    no-follow stat instead of the errno alone.
+    """
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except (OSError, NotImplementedError):
+        return False
+    return stat.S_ISLNK(info.st_mode)
 
 
 class TfWorker:
@@ -130,14 +151,16 @@ class TfWorker:
             # uses, before anything at all is unmounted or written.
             got = inspector.recheck(plan["device"], plan)
             if plan["mode"] == "format":
-                if not self._already_formatted(cid, plan, got):
+                record = self._already_formatted(cid, plan, got)
+                if record is None:
                     # The reserve must still carry the prepared filesystem
-                    # before the first write, unless a *formatted* checkpoint
-                    # proves our own earlier mkfs produced a different UUID.
+                    # before the first write, unless a durable checkpoint proves
+                    # our own earlier mkfs produced a different UUID.
                     self._verify_snapshot_uuid(plan, got)
                     got = self._format(plan, got, inspector)
                 else:
                     got = self._verify_formatted(plan, got)
+                    self._promote_checkpoint(cid, record, plan, got)
             else:
                 self._verify_snapshot_uuid(plan, got)
                 got = self._verify_formatted(plan, got)
@@ -153,26 +176,58 @@ class TfWorker:
     # -- format -------------------------------------------------------------
 
     def _already_formatted(self, cid, plan, got):
-        """True when a durable formatted checkpoint matches the live reserve.
+        """The durable checkpoint that proves the live ext4 reserve is ours.
 
         This is the resume path: an interrupted run that already formatted the
-        reserve must never call ``sgdisk``/``mkfs`` again.
+        reserve must never call ``sgdisk``/``mkfs`` again.  Two records qualify
+        for the same CID, capacity and handoff:
+
+        * ``formatted`` with its recorded ``linux_fs_uuid`` equal to the live
+          UUID (the legacy resume path), or
+        * ``validated`` with a valid non-empty ``intended_fs_uuid`` equal to the
+          live UUID -- the UUID persisted *before* ``mkfs.ext4 -U``, which
+          covers an interrupt between mkfs and the formatted checkpoint.
+
+        Anything else (no checkpoint, another filesystem, a missing or
+        mismatched intended UUID) returns ``None`` so the caller keeps the
+        original unchanged-target protection.
         """
         record = tf_state.read_checkpoint(self._checkpoint, cid)
-        if not isinstance(record, dict) or record.get("stage") != "formatted":
-            return False
-        if record.get("size_bytes") != plan.get("size_bytes"):
-            return False
+        if not isinstance(record, dict) or record.get("size_bytes") != plan.get("size_bytes"):
+            return None
         if got.get("filesystem_type") != "ext4":
-            return False
-        if _norm(record.get("linux_fs_uuid")) != _norm(got.get("filesystem_uuid")):
-            return False
+            return None
+        stage = record.get("stage")
+        live = _norm(got.get("filesystem_uuid"))
+        if not live:
+            return None
+        if stage == "formatted":
+            if _norm(record.get("linux_fs_uuid")) != live:
+                return None
+        elif stage == "validated":
+            intended = _norm(record.get("intended_fs_uuid"))
+            if not _UUID32.match(intended) or intended != live:
+                return None
+        else:
+            return None
         try:
             if record.get("handoff") != plan.get("handoff"):
-                return False
+                return None
         except Exception:  # pragma: no cover - defensive
-            return False
-        return True
+            return None
+        return record
+
+    def _promote_checkpoint(self, cid, record, plan, got):
+        """Promote a validated resume record once the ext4 filesystem is proven.
+
+        Only ever runs after ``_already_formatted`` matched the live ext4 UUID;
+        a formatted record is left exactly as it is.
+        """
+        if record.get("stage") != "validated":
+            return
+        tf_state.write_checkpoint(self._checkpoint, cid,
+                                  self._checkpoint_payload(plan, got, "formatted",
+                                                           record.get("intended_fs_uuid")))
 
     def _verify_formatted(self, plan, got):
         """Confirm an existing reserve is usable ext4 without reformatting it."""
@@ -188,8 +243,8 @@ class TfWorker:
         the prepared snapshot UUID refuses a reserve that was reformatted or
         swapped since the plan was built, before anything is written.  The one
         legitimate divergence -- a resume whose new UUID was produced by our own
-        ``mkfs`` -- is proven by a formatted checkpoint before this check is
-        reached, so this is never a false old-versus-new comparison.
+        ``mkfs`` -- is proven by a formatted or validated checkpoint before this
+        check is reached, so this is never a false old-versus-new comparison.
         """
         expected = _norm(plan.get("filesystem_uuid"))
         live = _norm(got.get("filesystem_uuid"))
@@ -200,10 +255,16 @@ class TfWorker:
     def _format(self, plan, got, inspector):
         cid = str(plan["card_cid"]).lower()
         self._set_phase("formatting", "Preparing to format only the reserve partition")
+        # The UUID the new ext4 filesystem is going to get.  It is generated and
+        # persisted in the validated checkpoint *before* anything is retyped or
+        # formatted, so an interrupt between a successful mkfs and the formatted
+        # checkpoint is recognisable (and resumable) without reformatting.
+        intended = str(uuid.uuid4())
         # Durable checkpoint BEFORE any format: the validated descriptor plus the
         # exact Android p2/p3 geometry, so a partial failure can recover without
         # ever re-reading (or touching) the Android side.
-        tf_state.write_checkpoint(self._checkpoint, cid, self._checkpoint_payload(plan, got, "validated"))
+        tf_state.write_checkpoint(self._checkpoint, cid,
+                                  self._checkpoint_payload(plan, got, "validated", intended))
         self._unmount_reserve(got["reserve_device"])
         # Re-prove SD/boot/GPT/CID *and* the live reserve filesystem UUID
         # immediately before the first write.
@@ -219,28 +280,34 @@ class TfWorker:
         self._checked(["udevadm", "settle"])
         label = "ARMADA_TF_%s" % cid[-6:]
         self._log("Formatting only %s" % got["reserve_device"])
-        self._checked(["mkfs.ext4", "-F", "-E", "nodiscard", "-L", label, got["reserve_device"]],
-                      timeout=MKFS_TIMEOUT)
+        self._checked(["mkfs.ext4", "-F", "-E", "nodiscard", "-U", intended, "-L", label,
+                       got["reserve_device"]], timeout=MKFS_TIMEOUT)
         self._checked(["udevadm", "settle"])
-        uuid, fstype = self._blkid(got["reserve_device"])
-        if fstype != "ext4" or not uuid:
-            raise WorkerError("format_failed", "the reserve partition is not a new ext4 filesystem")
-        got = dict(got, filesystem_uuid=uuid, filesystem_type="ext4",
+        uuid_value, fstype = self._blkid(got["reserve_device"])
+        if fstype != "ext4" or _norm(uuid_value) != _norm(intended):
+            raise WorkerError("format_failed",
+                              "the reserve partition is not the new ext4 filesystem it should be")
+        got = dict(got, filesystem_uuid=uuid_value, filesystem_type="ext4",
                    reserve_type=tf_card.RESERVE_CONNECTED)
         # Durable checkpoint BEFORE mounting so a crash while mounting still
-        # resumes directly to mount without a second mkfs.
-        tf_state.write_checkpoint(self._checkpoint, cid, self._checkpoint_payload(plan, got, "formatted"))
+        # resumes directly to mount without a second mkfs.  The intended UUID is
+        # retained so both resume paths keep working.
+        tf_state.write_checkpoint(self._checkpoint, cid,
+                                  self._checkpoint_payload(plan, got, "formatted", intended))
         return got
 
-    def _checkpoint_payload(self, plan, got, stage):
+    def _checkpoint_payload(self, plan, got, stage, intended=None):
         table = plan.get("table") if isinstance(plan.get("table"), dict) else {}
         parts = table.get("partitions") if isinstance(table.get("partitions"), list) else []
         android = parts[1:3] if len(parts) >= 3 else []
-        return {"stage": stage, "card_cid": str(plan["card_cid"]).lower(),
-                "size_bytes": plan.get("size_bytes"), "handoff": plan.get("handoff"),
-                "reserve_device": got.get("reserve_device"),
-                "reserve_type": got.get("reserve_type"), "android_parts": android,
-                "linux_fs_uuid": got.get("filesystem_uuid")}
+        payload = {"stage": stage, "card_cid": str(plan["card_cid"]).lower(),
+                   "size_bytes": plan.get("size_bytes"), "handoff": plan.get("handoff"),
+                   "reserve_device": got.get("reserve_device"),
+                   "reserve_type": got.get("reserve_type"), "android_parts": android,
+                   "linux_fs_uuid": got.get("filesystem_uuid")}
+        if intended is not None:
+            payload["intended_fs_uuid"] = intended
+        return payload
 
     # -- mount --------------------------------------------------------------
 
@@ -323,33 +390,65 @@ class TfWorker:
             raise WorkerError("marker_failed", "could not write the Linux marker: %s" % error) from error
 
     def _ensure_library(self, mountroot):
-        root_real = Path(mountroot).resolve()
-        library = Path(mountroot) / LIBRARY_NAME
-        steamapps = library / STEAMAPPS_NAME
-        for candidate in (library, steamapps):
-            if candidate.is_symlink():
-                raise WorkerError("library_unsafe", "the %s path is a symlink" % candidate.name)
-            resolved = candidate.resolve()
-            if root_real != resolved and root_real not in resolved.parents:
-                raise WorkerError("library_unsafe", "the %s path escapes the mount" % candidate.name)
+        """Create and own ``SteamLibrary/steamapps`` through pinned descriptors.
+
+        The mount is opened ``O_DIRECTORY|O_NOFOLLOW`` and both managed
+        directories are created and pinned relative to it (``dir_fd``) *before*
+        any ownership transfer, then owned by ``fchown`` on those descriptors,
+        leaf first.  A path that is swapped for a symlink between the creation
+        and the ``chown`` therefore cannot redirect the ownership change outside
+        the card, and a retry re-owns root-owned leftovers instead of skipping
+        them.  Nothing else is ever walked, so game files keep their owner and
+        data.
+        """
         try:
             account = pwd.getpwuid(self._steam_uid)
         except KeyError as error:
             raise WorkerError("library_failed", "no UID %d account on this device" % self._steam_uid) from error
-        created = []
-        for candidate in (library, steamapps):
-            if not candidate.exists():
-                try:
-                    candidate.mkdir()
-                except OSError as error:
-                    raise WorkerError("library_failed", "could not create %s: %s" % (candidate, error)) from error
-                created.append(candidate)
-        for path in created:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        root_fd = library_fd = steamapps_fd = None
+        try:
             try:
-                os.chown(path, account.pw_uid, account.pw_gid)
+                root_fd = os.open(os.fspath(mountroot), flags)
             except OSError as error:
-                raise WorkerError("library_failed", "could not own %s: %s" % (path, error)) from error
-        return library
+                if error.errno == errno.ELOOP:
+                    raise WorkerError("library_unsafe", "the mount path is a symlink") from error
+                raise WorkerError("library_failed",
+                                  "could not open %s: %s" % (mountroot, error)) from error
+            library_fd = self._pinned_directory(root_fd, LIBRARY_NAME, flags)
+            steamapps_fd = self._pinned_directory(library_fd, STEAMAPPS_NAME, flags)
+            for descriptor, name in ((steamapps_fd, STEAMAPPS_NAME), (library_fd, LIBRARY_NAME)):
+                try:
+                    os.fchown(descriptor, account.pw_uid, account.pw_gid)
+                except OSError as error:
+                    raise WorkerError("library_failed", "could not own %s: %s" % (name, error)) from error
+        finally:
+            for descriptor in (steamapps_fd, library_fd, root_fd):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:  # pragma: no cover - defensive
+                        pass
+        return Path(mountroot) / LIBRARY_NAME
+
+    @staticmethod
+    def _pinned_directory(parent_fd, name, flags):
+        """Create ``name`` inside ``parent_fd`` and return it pinned as a directory."""
+        try:
+            os.mkdir(name, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise WorkerError("library_failed", "could not create %s: %s" % (name, error)) from error
+        try:
+            return os.open(name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            # A symlinked directory surfaces as ELOOP or ENOTDIR depending on
+            # the kernel/filesystem; only a proven symlink is unsafe, so an
+            # ordinary non-directory file still fails as library_failed.
+            if error.errno in (errno.ELOOP, errno.ENOTDIR) and _is_symlink_at(parent_fd, name):
+                raise WorkerError("library_unsafe", "the %s path is a symlink" % name) from error
+            raise WorkerError("library_failed", "could not open %s: %s" % (name, error)) from error
 
     # -- steam registration -------------------------------------------------
 

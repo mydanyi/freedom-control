@@ -14,6 +14,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -151,6 +152,30 @@ class TfRunner:
         return [call for call in self.calls if call[0] == "systemd-run"]
 
 
+class GatedTfRunner(TfRunner):
+    """A runner whose first ``systemd-run`` blocks until the test releases it.
+
+    The gate lets one service's ``start`` be held inside its launch while a
+    second service over the same runtime tries to start, without a sleep.  Only
+    the first launch is held, so a broken guard fails the assertions instead of
+    deadlocking the test thread on a second gate.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.launch_entered = threading.Event()
+        self.launch_release = threading.Event()
+        self._gate = 1
+
+    def __call__(self, argv, **kwargs):
+        if isinstance(argv, list) and argv and argv[0] == "systemd-run" and self._gate:
+            self._gate -= 1
+            self.launch_entered.set()
+            if not self.launch_release.wait(5):
+                raise AssertionError("the launch gate was never released")
+        return super().__call__(argv, **kwargs)
+
+
 class TfFacadeTestCase(unittest.TestCase):
     reserve_type = tf_card.RESERVE_PENDING
 
@@ -168,10 +193,15 @@ class TfFacadeTestCase(unittest.TestCase):
         self.runner.children = TfRunner._children(self.reserve_type)
         self._patch(pathlib.Path, "is_block_device", lambda self: True)
         self._patch(service.os, "stat", self._stat)
+        # A newer inspector probes whether an interrupted ext4 reserve needs a
+        # temporary recovery mount.  This synthetic block device must never be
+        # opened, so the probe is stubbed like the other read guards; create=True
+        # keeps the fixture working until that helper lands in tf_inspection.
+        self._patch(tf_inspection, "_ext4_needs_recovery", lambda *_args, **_kwargs: False, create=True)
         self._set_is_mount(())
 
-    def _patch(self, obj, name, value):
-        started = patch.object(obj, name, value)
+    def _patch(self, obj, name, value, **options):
+        started = patch.object(obj, name, value, **options)
         started.start()
         self.addCleanup(started.stop)
 
@@ -450,6 +480,126 @@ class LibraryRetryTests(TfFacadeTestCase):
         self.assertFalse(svc._plan_path.exists())
         self.assertEqual(svc._status_path.read_text(encoding="utf-8"), old_status)
         self.assertEqual(svc._log_path.read_bytes(), b"old-log\n")
+
+
+class LibraryIdentityTests(TfFacadeTestCase):
+    """A non-idle operation names the card of its persisted plan, or nothing."""
+
+    RUNNING = "LoadState=loaded\nActiveState=active\nSubState=running\n"
+    SUCCEEDED = ("LoadState=loaded\nActiveState=active\nSubState=exited\n"
+                 "Result=success\nExecMainStatus=0\n")
+
+    def _prepared(self, svc):
+        self._write_marker(self._existing_mount(), tf_inspection.ANDROID_HANDOFF_RELATIVE, handoff())
+        return svc.prepare(DISK)
+
+    def test_start_and_status_report_the_launched_card(self):
+        svc = self._service()
+        plan = self._prepared(svc)
+        result = svc.start(plan["token"], confirmed=True)
+        self.assertEqual((result["card_cid"], result["device"]), (CID, DISK))
+        self.runner.unit_show = self.RUNNING
+        status = svc.status()
+        self.assertEqual((status["state"], status["card_cid"], status["device"]),
+                         ("running", CID, DISK))
+
+    def test_a_reopened_service_identifies_the_persisted_card(self):
+        svc = self._service()
+        plan = self._prepared(svc)
+        svc.start(plan["token"], confirmed=True)
+        # A second instance over the same runtime is what a reopened tab sees.
+        self.runner.unit_show = self.SUCCEEDED
+        status = self._service().status()
+        self.assertEqual((status["state"], status["card_cid"], status["device"]),
+                         ("succeeded", CID, DISK))
+
+    def test_no_identity_is_invented_without_a_valid_plan(self):
+        svc = self._service()
+        self.runner.unit_show = self.RUNNING
+        tf_state.atomic_write_json(svc._status_path,
+                                   {"state": "running", "phase": "mounting", "detail": ""})
+        # Nothing was launched, so a stale status record names no card.
+        self.assertIsNone(svc.status().get("card_cid"))
+        self.assertIsNone(svc.status().get("device"))
+        svc._plan_path.parent.mkdir(parents=True, exist_ok=True)
+        for record in ({"device": "mmcblk0", "card_cid": CID},
+                       {"device": DISK, "card_cid": "not-a-cid"},
+                       {"device": DISK},
+                       {"card_cid": CID}):
+            with self.subTest(record=record):
+                tf_state.atomic_write_json(svc._plan_path, record)
+                status = svc.status()
+                self.assertIsNone(status.get("card_cid"))
+                self.assertIsNone(status.get("device"))
+        # A valid plan still yields nothing while the operation is idle.  The
+        # running record written above must be replaced by an idle one first,
+        # because the service reports an idle unit together with a running
+        # record as running.
+        tf_state.atomic_write_json(svc._status_path,
+                                   {"state": "idle", "phase": "", "detail": ""})
+        tf_state.atomic_write_json(svc._plan_path, {"device": DISK, "card_cid": CID})
+        self.runner.unit_show = "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+        status = svc.status()
+        self.assertEqual(status["state"], "idle")
+        self.assertIsNone(status.get("card_cid"))
+
+
+class LibraryConcurrencyTests(TfFacadeTestCase):
+    """Two service objects over one runtime must not race the shared unit."""
+
+    SUCCEEDED = ("LoadState=loaded\nActiveState=active\nSubState=exited\n"
+                 "Result=success\nExecMainStatus=0\n")
+
+    def setUp(self):
+        super().setUp()
+        runner = GatedTfRunner()
+        runner.table = table(self.reserve_type)
+        runner.children = TfRunner._children(self.reserve_type)
+        # The terminal state that a stale reader would act on: without the
+        # shared lock the second instance would stop the first instance's run.
+        runner.unit_show = self.SUCCEEDED
+        self.runner = runner
+        self._write_marker(self._existing_mount(), tf_inspection.ANDROID_HANDOFF_RELATIVE, handoff())
+        self.first = self._service()
+        self.second = self._service()
+
+    def test_a_second_instance_cannot_stop_or_relaunch_the_first(self):
+        first_plan = self.first.prepare(DISK)
+        second_plan = self.second.prepare(DISK)
+        outcome = {}
+
+        def launch():
+            try:
+                outcome["result"] = self.first.start(first_plan["token"], confirmed=True)
+            except BaseException as error:  # noqa: BLE001 - reported by the assertions
+                outcome["error"] = error
+
+        thread = threading.Thread(target=launch)
+        thread.start()
+        try:
+            self.assertTrue(self.runner.launch_entered.wait(5), "the first launch never started")
+            calls_while_held = list(self.runner.calls)
+            plan_bytes = self.first._plan_path.read_bytes()
+            with self.assertRaises(service.InstallerError) as caught:
+                self.second.start(second_plan["token"], confirmed=True)
+            self.assertEqual(caught.exception.code, "unit_running")
+            with self.assertRaises(service.InstallerError) as status_blocked:
+                self.second.status()
+            self.assertEqual(status_blocked.exception.code, "status_unavailable")
+            # The refused instance neither re-read the card nor cleaned up,
+            # rewrote the plan or launched a unit of its own.
+            self.assertEqual(self.runner.calls, calls_while_held)
+            self.assertEqual(self.first._plan_path.read_bytes(), plan_bytes)
+        finally:
+            self.runner.launch_release.set()
+            thread.join(10)
+        self.assertFalse(thread.is_alive(), "the first start never returned")
+        self.assertNotIn("error", outcome, outcome.get("error"))
+        # Exactly one launch ran, and the succeeded unit was stopped only once,
+        # by the first instance, before its own launch.
+        self.assertEqual(len(self.runner.launched()), 1)
+        self.assertEqual([call for call in self.runner.calls if call[:2] == ["systemctl", "stop"]],
+                         [["systemctl", "stop", service.TF_UNIT]])
 
 
 if __name__ == "__main__":

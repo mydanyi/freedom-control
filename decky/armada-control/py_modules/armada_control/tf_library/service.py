@@ -7,9 +7,11 @@ GPL-3.0-or-later.  The copyright stays with the original author; the migrated
 code is distributed here as part of this GPL-2.0 project with the copyright
 holder's permission.  The fixed runtime and checkpoint paths and the
 ``armada-tf-library.service`` unit name are retained so both plugins share one
-job state and a running conversion can be recovered after a restart; overlap is
-prevented only by the lock file and the unit-state check below, not by any
-absolute guarantee.
+job state and a running conversion can be recovered after a restart.  Overlap
+between two copies of *this* module is prevented by one shared lifecycle
+``flock`` plus the unit-state check below; that is not an absolute guarantee,
+because a legacy plugin build that never takes the lifecycle lock cannot be
+forced to obey it.
 
 The Decky process never touches a card itself.  ``inspect``/``prepare`` only
 read state; the single mutation is a fixed ``armada-tf-library.service`` unit
@@ -107,6 +109,26 @@ def _state_of(fields):
     raise InstallerError("status_unavailable", "could not read the installer unit state")
 
 
+def _plan_identity(record):
+    """The card identity of a persisted plan, or ``None`` when it is unusable.
+
+    Only a record that names a real ``/dev`` node and a valid 32-character card
+    CID yields an identity.  A missing or malformed record never produces a
+    guessed one: the caller must not attribute an operation to an arbitrary
+    card the user then "retries" by accident.
+    """
+    if not isinstance(record, dict):
+        return None
+    device = record.get("device")
+    if not isinstance(device, str) or not device.startswith("/dev/"):
+        return None
+    try:
+        cid = tf_state.safe_cid(record.get("card_cid"))
+    except ValueError:
+        return None
+    return {"card_cid": cid, "device": device}
+
+
 # ---------------------------------------------------------------------------
 # TF library: read-only inspection and prepared plans
 # ---------------------------------------------------------------------------
@@ -115,6 +137,8 @@ DEFAULT_TF_SYSFS = Path("/sys")
 DEFAULT_TF_RUNTIME = Path("/run/armada-installer-tf")
 DEFAULT_TF_CHECKPOINT = Path(tf_state.CHECKPOINT_DIR)
 TF_UNIT = "armada-tf-library.service"
+# One cross-instance guard file inside the (root-owned) runtime directory.
+LOCK_NAME = "lifecycle.lock"
 CRITICAL_MOUNTS = ("/var", "/boot", "/home")
 
 
@@ -175,6 +199,50 @@ class _ReserveLock:
             self._handle.close()
 
 
+class _LifecycleLock:
+    """Cross-instance guard for one injected TF runtime directory.
+
+    A ``TfLibraryService`` only owns a process-local ``RLock``; two instances
+    (a second plugin load, a second panel) share the same unit/plan/status
+    files and each could read the same terminal unit state, so one would stop
+    the run the other had just relaunched.  This takes a non-blocking ``flock``
+    on one shared, root-owned file under that runtime directory: it is held for
+    the whole start decision and for the status aggregation, so unit, plan and
+    status identity always describe one operation.  Contention fails fast with
+    the caller's stable busy code (``unit_running``/``status_unavailable``)
+    before any snapshot, cleanup or write is attempted.
+    """
+
+    def __init__(self, path, shared=False, busy_code="unit_running", error_code="launch_failed"):
+        self._path = Path(path)
+        self._shared = shared
+        self._busy_code = busy_code
+        self._error_code = error_code
+        self._handle = None
+
+    def __enter__(self):
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            handle = self._path.open("a+")
+        except OSError as error:
+            raise InstallerError(self._error_code, str(error)) from error
+        try:
+            mode = fcntl.LOCK_SH if self._shared else fcntl.LOCK_EX
+            fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+        except OSError as error:
+            handle.close()
+            raise InstallerError(self._busy_code,
+                                 "another TF library operation is in progress") from error
+        self._handle = handle
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+
+
 class TfLibraryService:
     """Public facade for the Armada TF-card library conversion.
 
@@ -216,6 +284,10 @@ class TfLibraryService:
     def _log_path(self):
         return self._runtime / tf_state.LOG_NAME
 
+    @property
+    def _lock_path(self):
+        return self._runtime / LOCK_NAME
+
     # -- public API ---------------------------------------------------------
 
     def inspect(self):
@@ -242,7 +314,10 @@ class TfLibraryService:
         UUID must still match the prepared snapshot, otherwise the launch is
         refused with ``target_changed``.  A running conversion is refused with
         ``unit_running``.  Before the launch the plan and an initial status
-        record are written atomically (``0600``) to fixed runtime paths.
+        record are written atomically (``0600``) to fixed runtime paths.  The
+        whole decision runs under the shared lifecycle lock, so a concurrent
+        start from another service instance over the same runtime directory is
+        refused with ``unit_running`` before it reads, cleans up or writes.
         """
         if confirmed is not True:
             raise InstallerError("confirmation_required", "explicit confirmation is required")
@@ -250,37 +325,52 @@ class TfLibraryService:
             if not token or self._token is None or token != self._token or not isinstance(self._plan, dict):
                 raise InstallerError("unknown_token", "prepare the library conversion again")
             plan = self._plan
-            # Read the existing unit state once; a running conversion is refused
-            # untouched, and the same reading decides the terminal cleanup below.
-            state = self._tf_state()
-            if state == "running":
-                raise InstallerError("unit_running", "a TF library conversion is already running")
-            # Re-inspect the physical card before anything is written.  This
-            # briefly takes the automount lock via the inspector's read-only
-            # mount, and the worker's longer lock is only taken once it runs.
-            seen = self._inspector.snapshot(plan["device"])
-            self._ensure_unchanged(plan, seen)
-            # A stale terminal unit must be cleared before the new run is
-            # prepared: a failed transient unit is cleared with reset-failed and
-            # a succeeded one with stop.  This runs before the token is consumed
-            # and before the plan/status/log are written, so a cleanup failure
-            # leaves the previous record and log intact and never launches.
-            self._clear_unit(state)
-            # The token is single use: consume it before the launch is attempted.
-            self._token, self._plan = None, None
-            self._write_plan(plan, seen)
-            self._write_status({"state": "running", "phase": "preparing", "detail": ""})
-            self._truncate_log()
-            try:
-                result = _capture(self._runner, self._tf_argv())
-            except (OSError, subprocess.SubprocessError) as error:
-                self._write_status({"state": "failed", "phase": "preparing", "detail": "launch_failed"})
-                raise InstallerError("launch_failed", str(error)) from error
-            if result.returncode:
-                detail = (result.stderr or "").strip() or "systemd-run could not start the TF library worker"
-                self._write_status({"state": "failed", "phase": "preparing", "detail": detail})
-                raise InstallerError("launch_failed", detail)
-            return {"state": "running", "phase": "preparing", "detail": "", "log_tail": ""}
+            # The instance ``RLock`` above only covers this object.  A second
+            # service instance shares the same unit/plan/status files, so the
+            # whole read-decide-write-launch sequence runs under one shared
+            # non-blocking flock: a concurrent start fails with ``unit_running``
+            # before it can re-read a terminal unit state and stop the run this
+            # one is launching.
+            with _LifecycleLock(self._lock_path):
+                # Read the existing unit state once; a running conversion is
+                # refused untouched, and the same reading decides the terminal
+                # cleanup below.
+                state = self._tf_state()
+                if state == "running":
+                    raise InstallerError("unit_running", "a TF library conversion is already running")
+                # Re-inspect the physical card before anything is written.  This
+                # briefly takes the automount lock via the inspector's read-only
+                # mount, and the worker's longer lock is only taken once it runs.
+                seen = self._inspector.snapshot(plan["device"])
+                self._ensure_unchanged(plan, seen)
+                # A stale terminal unit must be cleared before the new run is
+                # prepared: a failed transient unit is cleared with reset-failed
+                # and a succeeded one with stop.  This runs before the token is
+                # consumed and before the plan/status/log are written, so a
+                # cleanup failure leaves the previous record and log intact and
+                # never launches.
+                self._clear_unit(state)
+                # The token is single use: consume it before the launch.
+                self._token, self._plan = None, None
+                self._write_plan(plan, seen)
+                self._write_status({"state": "running", "phase": "preparing", "detail": ""})
+                self._truncate_log()
+                try:
+                    result = _capture(self._runner, self._tf_argv())
+                except (OSError, subprocess.SubprocessError) as error:
+                    self._write_status({"state": "failed", "phase": "preparing", "detail": "launch_failed"})
+                    raise InstallerError("launch_failed", str(error)) from error
+                if result.returncode:
+                    detail = (result.stderr or "").strip() or "systemd-run could not start the TF library worker"
+                    self._write_status({"state": "failed", "phase": "preparing", "detail": detail})
+                    raise InstallerError("launch_failed", detail)
+                started = {"state": "running", "phase": "preparing", "detail": "", "log_tail": ""}
+                # The freshly written plan names the card this run is bound to,
+                # so a retry after reopening can find that same card again.
+                identity = _plan_identity({"device": plan["device"], "card_cid": plan["card_cid"]})
+                if identity is not None:
+                    started.update(identity)
+                return started
 
     def status(self):
         """Merge the transient worker record with the real systemd unit state.
@@ -289,23 +379,38 @@ class TfLibraryService:
         still claims success; a running or successful unit likewise overrides
         an out-of-date record.  ``phase`` is one of ``preparing``,
         ``formatting``, ``mounting`` or ``registering`` (or empty when idle).
+
+        A non-idle operation also reports the ``card_cid``/``device`` of the
+        persisted plan that launched it, when that record is valid, so a
+        reopened tab can retry *that* card without guessing.  The shared
+        lifecycle lock is taken in shared, non-blocking mode: a launch that is
+        in progress reports ``status_unavailable`` instead of mixing a unit, a
+        plan and a status record from two different operations.
         """
         with self._lock:
-            unit = _state_of(self._tf_show())
-            record = tf_state.read_json(self._status_path) or {}
-            state, phase = record.get("state"), record.get("phase") or ""
-            detail = str(record.get("detail") or "")
-            if unit in ("failed", "running", "succeeded"):
-                state = unit
-                if unit == "running" and phase not in tf_state.PHASES:
-                    phase = "preparing"
-            if state not in tf_state.STATES:
-                state = "idle"
-                phase = ""
-            return {"state": state, "phase": phase, "detail": detail, "log_tail": self._log_tail(),
-                    "library_requested": bool(record.get("library_requested")),
-                    "library_registered": bool(record.get("library_registered")),
-                    "library_pending": bool(record.get("library_pending"))}
+            with _LifecycleLock(self._lock_path, shared=True,
+                                busy_code="status_unavailable", error_code="status_unavailable"):
+                unit = _state_of(self._tf_show())
+                record = tf_state.read_json(self._status_path) or {}
+                state, phase = record.get("state"), record.get("phase") or ""
+                detail = str(record.get("detail") or "")
+                if unit in ("failed", "running", "succeeded"):
+                    state = unit
+                    if unit == "running" and phase not in tf_state.PHASES:
+                        phase = "preparing"
+                if state not in tf_state.STATES:
+                    state = "idle"
+                    phase = ""
+                payload = {"state": state, "phase": phase, "detail": detail,
+                           "log_tail": self._log_tail(),
+                           "library_requested": bool(record.get("library_requested")),
+                           "library_registered": bool(record.get("library_registered")),
+                           "library_pending": bool(record.get("library_pending"))}
+                if state != "idle":
+                    identity = _plan_identity(tf_state.read_json(self._plan_path))
+                    if identity is not None:
+                        payload.update(identity)
+                return payload
 
     # -- helpers ------------------------------------------------------------
 

@@ -17,9 +17,10 @@ import type { Locale, TranslationKey } from "./i18n";
 import {
   bytesToGib,
   canReviewTfCard,
+  completedRetryCard,
   confirmSpecFor,
   libraryResult,
-  retryConnectAllowed,
+  retryPlanMatchesCard,
   successBodyKey,
 } from "./tf_model";
 import type { TfCard, TfPhase, TfPlan, TfStatus } from "./tf_types";
@@ -204,25 +205,31 @@ export function TfLibraryContent({ locale }: { locale: Locale }) {
   }, [busy, listRequested, modalOpen, openConfirm, retryRequested, selected, status, statusError]);
 
   // Retry connecting after a mount that Steam has not picked up yet: prepare a
-  // fresh mount plan and start it on this authorized click, never formatting.
+  // fresh mount plan for the card the completed status is bound to and start it
+  // on this authorized click, never formatting. The expected CID is captured
+  // before the async prepare so a re-prepared plan for another card (or a status
+  // that changed while we waited) can never be started silently.
   const retryConnect = useCallback(async () => {
     if (actionLock.current || busy) return;
-    if (!selected) return;
+    const expectedCid = status?.card_cid ?? null;
+    const target = completedRetryCard(cards, status);
+    if (!target) return;
     actionLock.current = true;
     setBusy(true);
     setActionError(null);
     setPollError(null);
     try {
-      const prepared = await prepareTfLibrary(selected.device);
+      const prepared = await prepareTfLibrary(target.device);
       if (!mounted.current) return;
       if (!prepared.ok) {
         setActionError({ code: prepared.error, detail: prepared.detail });
         return;
       }
-      // The mount-only retry may only start a fresh mount directly. If the card
-      // changed and re-prepared as a format, never run it from this click: that
-      // would erase the Linux reserve partition without the destructive confirm.
-      if (!retryConnectAllowed(prepared.data)) {
+      // The mount-only retry may only start a fresh mount of the same card. A
+      // different CID, or a card that changed and re-prepared as a format, is
+      // refused: that would either retry the wrong card or erase the Linux
+      // reserve partition without the destructive confirm.
+      if (!retryPlanMatchesCard(prepared.data, expectedCid)) {
         setActionError({ code: "target_changed", detail: "" });
         void loadCards();
         return;
@@ -246,7 +253,7 @@ export function TfLibraryContent({ locale }: { locale: Locale }) {
       actionLock.current = false;
       if (mounted.current) setBusy(false);
     }
-  }, [busy, loadCards, selected]);
+  }, [busy, cards, loadCards, status]);
 
   const reset = useCallback(() => {
     // Keep the real backend failure state: review proceeds only while the
@@ -269,6 +276,11 @@ export function TfLibraryContent({ locale }: { locale: Locale }) {
   }, [loadCards]);
 
   const running = status?.state === "running";
+
+  // A completed conversion may only be retried on the card identity the backend
+  // reported for it. With no usable identity (or no matching inspected card)
+  // Retry stays unavailable and only the explicit Back to cards path remains.
+  const retryTarget = completedRetryCard(cards, status);
 
   // A single recursive poll that survives errors and runs for the whole mount,
   // so re-opening the panel restores a running/succeeded/failed conversion. The
@@ -390,7 +402,7 @@ export function TfLibraryContent({ locale }: { locale: Locale }) {
               layout="below"
               childrenContainerWidth="max"
               onClick={() => { void retryConnect(); }}
-              disabled={busy}
+              disabled={busy || !retryTarget}
             >
               {text("tf.success.retryConnect")}
             </ButtonItem>

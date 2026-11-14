@@ -46,6 +46,39 @@ export function retryConnectAllowed(plan: TfPlan | null | undefined): boolean {
   return !!plan && plan.mode === "mount";
 }
 
+const CID = /^[0-9a-f]{32}$/;
+
+function normalizedCid(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim().toLowerCase();
+  return CID.test(text) ? text : null;
+}
+
+// The card a completed conversion is allowed to be retried on: it must be a
+// currently inspected, actionable card whose CID equals the identity the
+// backend reported with the finished status. The selected card and its
+// position in the list are irrelevant, and a missing or unrecognised identity
+// yields null so the UI never retries some other card automatically.
+export function completedRetryCard(cards: TfCard[], status: TfStatus | null): TfCard | null {
+  if (!status || status.state !== "succeeded") return null;
+  const wanted = normalizedCid(status.card_cid);
+  if (!wanted) return null;
+  return cards.find((card) => isReviewableCard(card) && normalizedCid(card.card_cid) === wanted) ?? null;
+}
+
+// A fresh retry plan may start directly only when it is still the mount-only
+// plan for the same card identity that completed. A plan re-prepared for a
+// different CID (or a format plan) must be refused, so the user reviews that
+// card and confirms it explicitly.
+export function retryPlanMatchesCard(
+  plan: TfPlan | null | undefined,
+  expectedCid: string | null | undefined,
+): boolean {
+  const wanted = normalizedCid(expectedCid);
+  if (!plan || !retryConnectAllowed(plan) || !wanted) return false;
+  return normalizedCid(plan.card_cid) === wanted;
+}
+
 export interface TfConfirmSpec {
   mode: "format" | "mount";
   // Only a format plan may use destructive wording. A mount plan preserves the

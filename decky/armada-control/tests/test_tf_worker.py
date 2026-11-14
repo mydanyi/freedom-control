@@ -9,6 +9,7 @@ halts, a formatted checkpoint resumes without a second ``mkfs``, connected cards
 are never formatted, and an absent Steam leaves the card mounted and pending.
 """
 
+import errno
 import json
 import os
 import pathlib
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -82,6 +84,7 @@ class WorkerRunner:
         self.blkid_values = {"UUID": RESERVE_FS_UUID, "TYPE": "vfat"}
         self.mounted = False
         self.mount_target = None
+        self.mount_options = "rw,relatime"
         self.steam_running = False
         self.ancestors = ["259:0"]
         self.ancestors_by_source = {}
@@ -130,14 +133,29 @@ class WorkerRunner:
         if command == "findmnt":
             if "--json" in argv:
                 entries = ([{"source": RESERVE, "target": str(self.mount_target), "fstype": "ext4",
-                             "options": "rw,relatime"}] if self.mounted else [])
+                             "options": self.mount_options}] if self.mounted else [])
                 return self._done(argv, 0, json.dumps({"filesystems": entries}))
             return self._done(argv, 0, "/dev/nvme0n1p2\n")
+        if command == "mount":
+            # Only the inspector's own read-only, argv-driven inspection mount of
+            # the reserve is modelled; its options are reflected back by findmnt.
+            options = argv[argv.index("-o") + 1] if "-o" in argv else ""
+            if argv[-2] != RESERVE or "ro" not in options.split(","):
+                raise AssertionError("unexpected mount: {}".format(argv))
+            self.mounted, self.mount_target = True, argv[-1]
+            self.mount_options = options
+            return self._done(argv, 0)
         if command == "umount":
+            if not self.mounted or str(self.mount_target) != argv[-1]:
+                return self._done(argv, 32, "", "not mounted")
             self.mounted, self.mount_target = False, None
+            self.mount_options = "rw,relatime"
             return self._done(argv, 0)
         if command == tf_worker.AUTOMOUNT_HELPER:
+            # The upstream automount helper mounts read-write, unlike the
+            # inspector's temporary read-only mount.
             self.mounted, self.mount_target = True, self.mount_target or self.default_mount
+            self.mount_options = "rw,relatime"
             return self._done(argv, 0)
         if command == "sgdisk":
             if self.sgdisk_rc == 0 and "--typecode=1:8300" in argv:
@@ -152,7 +170,10 @@ class WorkerRunner:
         if command == "mkfs.ext4":
             if self.mkfs_rc:
                 return self._done(argv, self.mkfs_rc, "", "mkfs failed")
-            self.blkid_values = {"UUID": NEW_FS_UUID, "TYPE": "ext4"}
+            # A real mkfs.ext4 honours ``-U``; model exactly that so a test can
+            # prove the worker formatted with the UUID it had already persisted.
+            wanted = argv[argv.index("-U") + 1] if "-U" in argv else NEW_FS_UUID
+            self.blkid_values = {"UUID": wanted, "TYPE": "ext4"}
             return self._done(argv, 0)
         if command == "systemd-run":
             if self.steam_rc == 0 and self.vdf_path is not None:
@@ -169,6 +190,45 @@ class WorkerRunner:
 
     def ran(self, *commands):
         return [call for call in self.calls if call[0] in commands]
+
+
+class OrderedRunner(WorkerRunner):
+    """A runner that notes the mkfs call inside a caller-supplied event list."""
+
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def __call__(self, argv, **kwargs):
+        if argv and argv[0] == "mkfs.ext4":
+            self.events.append(("mkfs", list(argv)))
+        return super().__call__(argv, **kwargs)
+
+
+class OwnershipRecorder:
+    """A meaningful ``os.fchown`` stand-in that records the *pinned* node.
+
+    It changes no real owner.  Instead it records the descriptor's own link and
+    ``(st_dev, st_ino)`` so a test can prove the ownership transfer addressed
+    the directory that was pinned, not whatever a path resolves to by then.
+    ``fail_next`` makes the next transfer fail like an unusable card.
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.fail_next = False
+
+    def __call__(self, descriptor, uid, gid):
+        link = os.readlink("/proc/self/fd/%d" % descriptor)
+        info = os.fstat(descriptor)
+        if self.fail_next:
+            self.fail_next = False
+            raise OSError(errno.EPERM, "the ownership change failed")
+        self.calls.append({"link": link, "inode": (info.st_dev, info.st_ino),
+                           "uid": uid, "gid": gid})
+
+    def inodes(self):
+        return [call["inode"] for call in self.calls]
 
 
 class WorkerTestCase(unittest.TestCase):
@@ -192,7 +252,12 @@ class WorkerTestCase(unittest.TestCase):
         self._patch(pathlib.Path, "is_block_device", lambda self: True)
         self._patch(pathlib.Path, "is_mount", lambda self: False)
         self._patch(service.os, "stat", self._stat)
-        self._patch(tf_worker.os, "chown", lambda *a, **k: None)
+        # The fake devices carry no readable superblock, so the real ext4
+        # journal probe is stubbed; its byte handling has its own tests.
+        self._patch(tf_inspection, "_ext4_needs_recovery", lambda device: False)
+        self.fchown = OwnershipRecorder()
+        self._patch(tf_worker.os, "fchown", self.fchown)
+        self._patch(tf_worker.uuid, "uuid4", lambda: uuid.UUID(NEW_FS_UUID))
         self._patch(tf_worker.pwd, "getpwuid", self._getpwuid)
 
     def _patch(self, obj, name, value):
@@ -230,6 +295,17 @@ class WorkerTestCase(unittest.TestCase):
 
     def _status(self):
         return tf_state.read_json(self.status_path) or {}
+
+    @staticmethod
+    def _inode(path):
+        info = os.stat(path)
+        return (info.st_dev, info.st_ino)
+
+    def _card_runner(self, runner=None):
+        runner = runner or WorkerRunner()
+        runner.default_mount = self.mount_dir
+        runner.vdf_path = self.home / ".local" / "share" / "Steam" / "steamapps"
+        return runner
 
 
 class BusyRunner(WorkerRunner):
@@ -477,6 +553,217 @@ class SteamTests(WorkerTestCase):
         self.assertTrue(status["library_requested"])
         self.assertTrue(status["library_registered"])
         self.assertFalse(status["library_pending"])
+
+
+class IntendedUuidTests(WorkerTestCase):
+    """The mkfs UUID is persisted before any write and resumes a crash as ext4."""
+
+    def test_the_mkfs_uuid_was_persisted_before_any_write(self):
+        events = []
+        runner = self._card_runner(OrderedRunner(events))
+        real = tf_state.write_checkpoint
+
+        def spy(directory, cid, payload):
+            events.append(("checkpoint", payload.get("stage"), payload.get("intended_fs_uuid")))
+            return real(directory, cid, payload)
+
+        with patch.object(tf_state, "write_checkpoint", spy):
+            code = self._worker(self._plan("format"), runner=runner).run()
+        self.assertEqual(code, 0)
+        mkfs_index = [index for index, event in enumerate(events) if event[0] == "mkfs"][0]
+        mkfs = events[mkfs_index][1]
+        intended = mkfs[mkfs.index("-U") + 1]
+        self.assertEqual(intended, NEW_FS_UUID)
+        self.assertIn("ARMADA_TF_%s" % CID[-6:], mkfs)
+        # Nothing but the intended record was persisted before mkfs ran.
+        self.assertEqual(events[:mkfs_index],
+                         [("checkpoint", "validated", intended)])
+        self.assertEqual(events[mkfs_index + 1:], [("checkpoint", "formatted", intended)])
+
+    def test_a_failed_intended_checkpoint_prevents_every_write(self):
+        with patch.object(tf_state, "write_checkpoint", side_effect=OSError("disk full")):
+            code = self._worker(self._plan("format")).run()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.runner.ran("umount", "sgdisk", "mkfs.ext4"), [])
+        self.assertEqual(self._status()["state"], "failed")
+
+    def test_a_crash_after_mkfs_resumes_without_a_second_format(self):
+        real = tf_state.write_checkpoint
+        crashed = []
+
+        def flaky(directory, cid, payload):
+            if payload.get("stage") == "formatted" and not crashed:
+                crashed.append(True)
+                raise OSError("simulated crash before the formatted checkpoint")
+            return real(directory, cid, payload)
+
+        with patch.object(tf_state, "write_checkpoint", flaky):
+            code = self._worker(self._plan("format")).run()
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.runner.ran("mkfs.ext4")), 1)
+        record = tf_state.read_checkpoint(self.checkpoint, CID)
+        self.assertEqual(record["stage"], "validated")
+        self.assertEqual(record["intended_fs_uuid"], NEW_FS_UUID)
+        self.assertEqual(record["linux_fs_uuid"], RESERVE_FS_UUID)
+
+        # The next scan recognises the ext4 the worker created out of the
+        # validated record, and the retry only mounts, marks and registers.
+        inspector = tf_inspection.TfInspector(runner=self.runner, sysfs_dir=self.sysfs,
+                                              runtime_dir=self.runtime,
+                                              checkpoint_dir=self.checkpoint)
+        card = inspector.inspect_cards()["cards"][0]
+        self.assertEqual((card["state"], card["reason"]), ("recovery", ""))
+        plan = inspector.snapshot(DISK)
+        self.assertEqual((plan["mode"], plan["recovery"]), ("mount", True))
+        code = self._worker(plan).run()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.runner.ran("mkfs.ext4")), 1)
+        self.assertEqual(len(self.runner.ran("sgdisk")), 1)
+        self.assertEqual(self._status()["state"], "succeeded")
+        self.assertTrue((self.mount_dir / tf_worker.MARKER_NAME).is_file())
+
+    def test_a_validated_intended_checkpoint_lets_a_format_retry_skip_mkfs(self):
+        self.runner.table = table(tf_card.RESERVE_CONNECTED)
+        self.runner.children = WorkerRunner._children(tf_card.RESERVE_CONNECTED)
+        self.runner.blkid_values = {"UUID": NEW_FS_UUID, "TYPE": "ext4"}
+        plan = self._plan("format")
+        plan["table"] = table(tf_card.RESERVE_CONNECTED)
+        tf_state.write_checkpoint(self.checkpoint, CID, {
+            "stage": "validated", "card_cid": CID, "size_bytes": DISK_BYTES, "handoff": handoff(),
+            "reserve_device": RESERVE, "reserve_type": tf_card.RESERVE_CONNECTED,
+            "android_parts": native_parts(tf_card.RESERVE_CONNECTED)[1:],
+            "linux_fs_uuid": RESERVE_FS_UUID, "intended_fs_uuid": NEW_FS_UUID})
+        code = self._worker(plan).run()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.runner.ran("sgdisk", "mkfs.ext4"), [])
+        record = tf_state.read_checkpoint(self.checkpoint, CID)
+        self.assertEqual((record["stage"], record["linux_fs_uuid"], record["intended_fs_uuid"]),
+                         ("formatted", NEW_FS_UUID, NEW_FS_UUID))
+
+    def test_a_mismatched_intended_uuid_is_refused_before_any_write(self):
+        self.runner.table = table(tf_card.RESERVE_CONNECTED)
+        self.runner.children = WorkerRunner._children(tf_card.RESERVE_CONNECTED)
+        self.runner.blkid_values = {"UUID": NEW_FS_UUID, "TYPE": "ext4"}
+        plan = self._plan("format")
+        plan["table"] = table(tf_card.RESERVE_CONNECTED)
+        tf_state.write_checkpoint(self.checkpoint, CID, {
+            "stage": "validated", "card_cid": CID, "size_bytes": DISK_BYTES, "handoff": handoff(),
+            "reserve_device": RESERVE, "reserve_type": tf_card.RESERVE_CONNECTED,
+            "android_parts": native_parts(tf_card.RESERVE_CONNECTED)[1:],
+            "linux_fs_uuid": RESERVE_FS_UUID,
+            "intended_fs_uuid": "11111111-2222-3333-4444-555555555555"})
+        code = self._worker(plan).run()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.runner.ran("sgdisk", "mkfs.ext4"), [])
+        self.assertIn("target_changed", self._status()["detail"])
+
+
+class LibraryOwnershipTests(WorkerTestCase):
+    """``SteamLibrary/steamapps`` are owned through pinned descriptors only."""
+
+    def _mount_plan(self):
+        self.runner.table = table(tf_card.RESERVE_CONNECTED)
+        self.runner.children = WorkerRunner._children(tf_card.RESERVE_CONNECTED)
+        self.runner.blkid_values = {"UUID": LINUX_FS_UUID, "TYPE": "ext4"}
+        return self._plan("mount")
+
+    def _prepare_tree(self):
+        library = self.mount_dir / "SteamLibrary"
+        steamapps = library / "steamapps"
+        game = steamapps / "common" / "game.bin"
+        game.parent.mkdir(parents=True)
+        game.write_bytes(b"game payload")
+        return library, steamapps, game
+
+    def _use_recorder(self, recorder):
+        self._patch(tf_worker.os, "fchown", recorder)
+        return recorder
+
+    def test_both_managed_directories_are_owned_leaf_first(self):
+        library, steamapps, _game = self._prepare_tree()
+        code = self._worker(self._mount_plan()).run()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.fchown.inodes(), [self._inode(steamapps), self._inode(library)])
+        for call in self.fchown.calls:
+            self.assertEqual((call["uid"], call["gid"]), (1000, 1000))
+
+    def test_a_child_swapped_for_a_symlink_cannot_redirect_the_ownership(self):
+        library, steamapps, game = self._prepare_tree()
+        pinned = steamapps.with_name("steamapps-pinned")
+        outside = self.root / "outside"
+        outside.mkdir()
+        sentinel = outside / "sentinel.txt"
+        sentinel.write_bytes(b"outside data")
+        outside_owner = os.stat(outside).st_uid
+        game_owner, game_inode = os.stat(game).st_uid, self._inode(game)
+
+        class Swapping(OwnershipRecorder):
+            swapped = False
+
+            def __call__(recorder, descriptor, uid, gid):
+                if not recorder.swapped:
+                    recorder.swapped = True
+                    os.rename(steamapps, pinned)
+                    os.symlink(outside, steamapps)
+                return OwnershipRecorder.__call__(recorder, descriptor, uid, gid)
+
+        recorder = self._use_recorder(Swapping())
+        code = self._worker(self._mount_plan()).run()
+        self.assertEqual(code, 0)
+        self.assertTrue(recorder.swapped)
+        self.assertTrue(os.path.islink(steamapps))
+        # The ownership transfer addressed the pinned directories, never the
+        # symlink target that replaced one of them.
+        self.assertEqual(recorder.inodes(), [self._inode(pinned), self._inode(library)])
+        self.assertEqual(os.stat(outside).st_uid, outside_owner)
+        self.assertEqual(sentinel.read_bytes(), b"outside data")
+        # The game file stayed exactly where it was, with its owner and data.
+        moved = pinned / "common" / "game.bin"
+        self.assertEqual(self._inode(moved), game_inode)
+        self.assertEqual(os.stat(moved).st_uid, game_owner)
+        self.assertEqual(moved.read_bytes(), b"game payload")
+
+    def test_a_failed_ownership_change_is_repaired_by_a_retry(self):
+        library, steamapps, _game = self._prepare_tree()
+        self.fchown.fail_next = True
+        code = self._worker(self._mount_plan()).run()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.fchown.calls, [])
+        self.assertIn("library_failed", self._status()["detail"])
+        # The leftover directories must be re-owned, not skipped because they exist.
+        code = self._worker(self._mount_plan()).run()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.fchown.inodes(), [self._inode(steamapps), self._inode(library)])
+
+    def test_game_files_keep_their_owner_and_data(self):
+        _library, _steamapps, game = self._prepare_tree()
+        before = os.stat(game)
+        code = self._worker(self._mount_plan()).run()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.fchown.calls), 2)
+        after = os.stat(game)
+        self.assertEqual((after.st_uid, after.st_gid), (before.st_uid, before.st_gid))
+        self.assertEqual(game.read_bytes(), b"game payload")
+
+    def test_a_symlinked_steamapps_is_still_refused(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        library = self.mount_dir / "SteamLibrary"
+        library.mkdir()
+        (library / "steamapps").symlink_to(outside)
+        code = self._worker(self._mount_plan()).run()
+        self.assertEqual(code, 1)
+        self.assertIn("library_unsafe", self._status()["detail"])
+        self.assertEqual(self.fchown.calls, [])
+
+    def test_a_regular_file_steamapps_is_not_mistaken_for_a_symlink(self):
+        library = self.mount_dir / "SteamLibrary"
+        library.mkdir()
+        (library / "steamapps").write_bytes(b"not a directory")
+        code = self._worker(self._mount_plan()).run()
+        self.assertEqual(code, 1)
+        self.assertIn("library_failed", self._status()["detail"])
+        self.assertEqual(self.fchown.calls, [])
 
 
 if __name__ == "__main__":

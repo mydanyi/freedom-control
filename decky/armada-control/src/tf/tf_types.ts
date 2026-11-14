@@ -65,4 +65,9 @@ export interface TfStatus {
   library_requested: boolean;
   library_registered: boolean;
   library_pending: boolean;
+  // Identity of the card this non-idle operation is bound to, reported from the
+  // persisted plan when the backend could prove it. Absent when idle or when
+  // the record is missing/malformed; never guessed.
+  card_cid?: string | null;
+  device?: string | null;
 }

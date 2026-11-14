@@ -14,6 +14,7 @@ import json
 import os
 import re
 import stat
+import struct
 import subprocess
 import threading
 from pathlib import Path
@@ -30,10 +31,23 @@ HANDOFF_INSTRUCTION = ("Open the Smart TF Card Allocator (智能TF卡分配器) 
 MARKER_INSTRUCTION = ("This card already carries a Linux-side handoff, but its handoff record is "
                       "missing. Leave the partitions as they are, insert the card into the device "
                       "that created it and check the installer logs, then rescan.")
+RECOVERY_INSTRUCTION = ("The Linux filesystem on this card still needs journal recovery, so it is "
+                        "not mounted read-only here. Insert the card into the device that wrote it, "
+                        "let it finish mounting, then rescan.")
+# The primary ext4 superblock: its magic (0xef53, LE16) and the incompat feature
+# flags (LE32) are all this module reads, before any mount could replay the
+# journal.  https://docs.kernel.org/filesystems/ext4/super.html
+EXT4_SUPER_OFFSET = 1024
+EXT4_SUPER_BYTES = 1024
+EXT4_SUPER_MAGIC = 0xEF53
+EXT4_SUPER_MAGIC_OFFSET = 0x38
+EXT4_INCOMPAT_OFFSET = 0x60
+EXT4_FEATURE_INCOMPAT_RECOVER = 0x4
 
 _LSBLK_COLUMNS = "NAME,PATH,TYPE,SIZE,PARTUUID,PKNAME"
 _WHOLE_MMCBLK = re.compile(r"/dev/mmcblk\d+\Z")
 _CID32 = re.compile(r"[0-9a-f]{32}\Z")
+_FS_UUID32 = re.compile(r"[0-9a-f]{32}\Z")
 
 
 class InspectorError(service.InstallerError):
@@ -71,6 +85,37 @@ def _run_json(runner, argv):
         return json.loads(result.stdout or "{}")
     except (TypeError, ValueError) as error:
         raise InspectorError("inspection_failed", "invalid %s output: %s" % (argv[0], error)) from error
+
+
+def _ext4_needs_recovery(reserve_device):
+    """True when the ext4 primary superblock still needs journal recovery.
+
+    Mounting ext4 read-only normally *replays* the journal, so this probe runs
+    before any inspection mount: it reads only the bounded primary superblock
+    (offset 1024, magic ``0xef53`` at relative ``0x38``, incompat flags LE32 at
+    ``0x60``) through ``O_RDONLY|O_NOFOLLOW`` and ``pread``.  An absent, short or
+    unreadable superblock is ``inspection_failed``; a set
+    ``EXT4_FEATURE_INCOMPAT_RECOVER`` bit means a mount would write the card.
+    """
+    try:
+        descriptor = os.open(str(reserve_device),
+                             os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError as error:
+        raise InspectorError("inspection_failed",
+                             "the ext4 superblock could not be read: %s" % error) from error
+    try:
+        block = os.pread(descriptor, EXT4_SUPER_BYTES, EXT4_SUPER_OFFSET)
+    except OSError as error:
+        raise InspectorError("inspection_failed",
+                             "the ext4 superblock could not be read: %s" % error) from error
+    finally:
+        os.close(descriptor)
+    if len(block) < EXT4_INCOMPAT_OFFSET + 4:
+        raise InspectorError("inspection_failed", "the ext4 superblock is truncated")
+    if struct.unpack_from("<H", block, EXT4_SUPER_MAGIC_OFFSET)[0] != EXT4_SUPER_MAGIC:
+        raise InspectorError("inspection_failed", "the reserve partition is not an ext4 filesystem")
+    flags = struct.unpack_from("<I", block, EXT4_INCOMPAT_OFFSET)[0]
+    return bool(flags & EXT4_FEATURE_INCOMPAT_RECOVER)
 
 
 def _record(device):
@@ -418,7 +463,7 @@ class TfInspector:
         if not uuid or fstype not in FAT_FS_TYPES:
             raise InspectorError("reserve_unprepared", "the reserve partition is not a FAT or exFAT volume")
         with self._reserve_lock(reserve_device):
-            mountpoint, owned = self._reserve_mount(reserve_device, cid)
+            mountpoint, owned = self._reserve_mount(reserve_device, cid, fstype)
             try:
                 raw = _read_marker(mountpoint, ANDROID_HANDOFF_RELATIVE)
             finally:
@@ -443,7 +488,7 @@ class TfInspector:
         if not uuid or fstype not in EXT_FS_TYPES:
             return self._recover_unformatted(card, table, reserve_device, cid, size, uuid, fstype)
         with self._reserve_lock(reserve_device):
-            mountpoint, owned = self._reserve_mount(reserve_device, cid)
+            mountpoint, owned = self._reserve_mount(reserve_device, cid, fstype)
             try:
                 raw = _read_marker(mountpoint, LINUX_MARKER_NAME)
             finally:
@@ -505,19 +550,33 @@ class TfInspector:
         """Resume an ext4 reserve whose Linux marker never landed.
 
         A missing marker is normally ``marker_missing``.  It is only accepted
-        as a resume when a durable formatted checkpoint exists for the *same*
-        CID/capacity/private GUID/Android geometry and its recorded new ext4
-        UUID matches the live ``blkid`` UUID.  A bare ext4 filesystem with no
-        marker and no matching checkpoint stays blocked, and nothing here ever
+        as a resume when a durable checkpoint exists for the *same*
+        CID/capacity/private GUID/Android geometry and it proves the live ext4
+        filesystem is ours:
+
+        * a ``formatted`` checkpoint whose recorded ``linux_fs_uuid`` equals the
+          live ``blkid`` UUID (the legacy resume path), or
+        * a ``validated`` checkpoint whose ``intended_fs_uuid`` is a valid
+          non-empty UUID equal to the live one -- the worker persisted that UUID
+          before ``mkfs.ext4 -U``, so an interrupt between mkfs and the formatted
+          checkpoint is recoverable without reformatting.
+
+        A bare ext4 filesystem, a legacy validated record with no intended UUID,
+        and any UUID mismatch all stay blocked, and nothing here ever writes or
         reformats anything.
         """
         record = tf_state.read_checkpoint(self._checkpoint_dir, cid)
-        if not isinstance(record, dict) or record.get("stage") != "formatted":
+        stage = record.get("stage") if isinstance(record, dict) else None
+        if stage not in ("formatted", "validated") or record.get("size_bytes") != size:
             raise InspectorError("marker_missing", MARKER_INSTRUCTION)
-        if record.get("size_bytes") != size:
-            raise InspectorError("marker_missing", MARKER_INSTRUCTION)
-        if _norm_uuid(record.get("linux_fs_uuid")) != _norm_uuid(uuid):
-            raise InspectorError("marker_missing", MARKER_INSTRUCTION)
+        if stage == "formatted":
+            expected_uuid = _norm_uuid(record.get("linux_fs_uuid"))
+            if not expected_uuid or expected_uuid != _norm_uuid(uuid):
+                raise InspectorError("marker_missing", MARKER_INSTRUCTION)
+        else:
+            intended = _norm_uuid(record.get("intended_fs_uuid"))
+            if not _FS_UUID32.match(intended) or intended != _norm_uuid(uuid):
+                raise InspectorError("marker_missing", MARKER_INSTRUCTION)
         stored_handoff = record.get("handoff")
         try:
             handoff = self._validate_handoff(stored_handoff)
@@ -598,16 +657,28 @@ class TfInspector:
         return service._ReserveLock(self._runtime.parent /
                                     ("jupiter-automount-%s.lock" % os.path.basename(device)))
 
-    def _reserve_mount(self, device, cid):
+    def _reserve_mount(self, device, cid, fstype=None):
+        """Mount the reserve read-only for inspection, reusing an active mount.
+
+        An already mounted card is handed back untouched: it is no new
+        inspection mount, so it is never re-probed or judged dirty.  A *new*
+        ext4 mount is preceded by :func:`_ext4_needs_recovery` and then uses
+        ``noload`` so opening the card never replays its journal; FAT/exFAT have
+        no journal and reject that option.
+        """
         existing = self._mounted_target(device)
         if existing:
             return Path(existing), False
+        ext4 = str(fstype or "").lower() in EXT_FS_TYPES
+        if ext4 and _ext4_needs_recovery(device):
+            raise InspectorError("filesystem_needs_recovery", RECOVERY_INSTRUCTION)
         base = self._runtime / "inspect" / cid
         try:
             base.mkdir(parents=True, exist_ok=True)
         except OSError as error:
             raise InspectorError("inspection_failed", str(error)) from error
-        result = service._capture(self._runner, ["mount", "-o", "ro,nosuid,nodev,noexec", device, str(base)])
+        options = "ro,noload,nodev,nosuid,noexec" if ext4 else "ro,nosuid,nodev,noexec"
+        result = service._capture(self._runner, ["mount", "-o", options, device, str(base)])
         if result.returncode:
             detail = (result.stderr or "").strip() or "could not mount the reserve read-only"
             raise InspectorError("inspection_failed", detail)

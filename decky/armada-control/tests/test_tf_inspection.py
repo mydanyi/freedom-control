@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import pathlib
+import struct
 import subprocess
 import sys
 import tempfile
@@ -202,7 +203,16 @@ class InspectionTestCase(unittest.TestCase):
         self.runner.children = TfRunner._children(self.reserve_type)
         self._patch(pathlib.Path, "is_block_device", lambda self: True)
         self._patch(tf_inspection.service.os, "stat", self._stat)
+        # The fake reserve carries no readable superblock, so the byte-level ext4
+        # journal probe is stubbed here; Ext4RecoveryProbeTests drives the real one.
+        self.recovery_probe = []
+        self.recovery_result = False
+        self._patch(tf_inspection, "_ext4_needs_recovery", self._needs_recovery)
         self._set_is_mount(())
+
+    def _needs_recovery(self, device):
+        self.recovery_probe.append(device)
+        return self.recovery_result
 
     def _patch(self, obj, name, value):
         started = patch.object(obj, name, value)
@@ -516,6 +526,178 @@ class SnapshotTests(InspectionTestCase):
         self.runner.blkid_values = {"UUID": "DEAD-BEEF", "TYPE": "vfat"}
         card = self._inspector().inspect_cards()["cards"][0]
         self.assertEqual((card["state"], card["reason"]), ("blocked", "reserve_unprepared"))
+
+
+class InspectionMountTests(InspectionTestCase):
+    """A new read-only inspection mount must never replay an ext4 journal."""
+
+    def _connected_ext4(self):
+        self.runner.table = table(tf_card.RESERVE_CONNECTED)
+        self.runner.children = TfRunner._children(tf_card.RESERVE_CONNECTED)
+        self.runner.blkid_values = {"UUID": LINUX_FS_UUID, "TYPE": "ext4"}
+
+    def _linux_marker(self, root):
+        marker = dict(handoff(public_partition_guid=None))
+        marker["linux_fs_uuid"] = LINUX_FS_UUID
+        self._write_marker(root, tf_inspection.LINUX_MARKER_NAME, marker)
+
+    def test_a_new_ext4_inspection_mount_uses_noload(self):
+        self._connected_ext4()
+        self._linux_marker(self.runtime / "inspect" / CID)
+        snapshot = self._inspector().snapshot(DISK)
+        self.assertEqual(snapshot["mode"], "mount")
+        mounts = self.runner.ran("mount")
+        self.assertEqual(len(mounts), 1)
+        self.assertEqual(mounts[0][1:4], ["-o", "ro,noload,nodev,nosuid,noexec", RESERVE])
+        # The journal probe ran before that mount, on the reserve partition only.
+        self.assertEqual(self.recovery_probe, [RESERVE])
+
+    def test_fat_and_exfat_inspection_mounts_never_add_noload(self):
+        for fstype in ("vfat", "exfat"):
+            with self.subTest(fstype=fstype):
+                self.runner.calls = []
+                self.runner.blkid_values = {"UUID": RESERVE_FS_UUID, "TYPE": fstype}
+                self._write_marker(self.runtime / "inspect" / CID,
+                                   tf_inspection.ANDROID_HANDOFF_RELATIVE, handoff())
+                snapshot = self._inspector().snapshot(DISK)
+                self.assertEqual(snapshot["filesystem_type"], fstype)
+                options = self.runner.ran("mount")[-1][2]
+                self.assertEqual(options, "ro,nosuid,nodev,noexec")
+                self.assertNotIn("noload", options)
+        self.assertEqual(self.recovery_probe, [])
+
+    def test_a_journal_needs_recovery_card_is_blocked_before_mounting(self):
+        self._connected_ext4()
+        self.recovery_result = True
+        card = self._inspector().inspect_cards()["cards"][0]
+        self.assertEqual((card["state"], card["reason"]),
+                         ("blocked", "filesystem_needs_recovery"))
+        self.assertEqual(self.recovery_probe, [RESERVE])
+        self.assertEqual(self.runner.ran("mount", "umount", "sgdisk", "mkfs.ext4"), [])
+
+    def test_a_mounted_ext4_reserve_is_reused_without_a_recovery_probe(self):
+        self._connected_ext4()
+        checkpoint_dir = self.root / "checkpoints"
+        tf_state.write_checkpoint(checkpoint_dir, CID, {
+            "stage": "formatted", "card_cid": CID, "size_bytes": DISK_BYTES,
+            "handoff": handoff(), "reserve_device": RESERVE,
+            "reserve_type": tf_card.RESERVE_CONNECTED,
+            "android_parts": native_parts(tf_card.RESERVE_CONNECTED)[1:],
+            "linux_fs_uuid": LINUX_FS_UUID})
+        self._existing_mount()
+        inspector = tf_inspection.TfInspector(runner=self.runner, sysfs_dir=self.sysfs,
+                                              runtime_dir=self.runtime,
+                                              checkpoint_dir=checkpoint_dir)
+        snapshot = inspector.snapshot(DISK)
+        self.assertEqual((snapshot["mode"], snapshot["recovery"]), ("mount", True))
+        # An active mount is handed back untouched: no probe, no new mount.
+        self.assertEqual(self.recovery_probe, [])
+        self.assertEqual(self.runner.ran("mount", "umount", "sgdisk", "mkfs.ext4"), [])
+
+
+class ConnectedRecoveryTests(InspectionTestCase):
+    """Only a checkpoint that proves the live ext4 UUID may resume a card."""
+
+    def setUp(self):
+        super().setUp()
+        self.runner.table = table(tf_card.RESERVE_CONNECTED)
+        self.runner.children = TfRunner._children(tf_card.RESERVE_CONNECTED)
+        self.runner.blkid_values = {"UUID": LINUX_FS_UUID, "TYPE": "ext4"}
+        self.checkpoint_dir = self.root / "checkpoints"
+
+    def _inspector(self):
+        return tf_inspection.TfInspector(runner=self.runner, sysfs_dir=self.sysfs,
+                                         runtime_dir=self.runtime,
+                                         checkpoint_dir=self.checkpoint_dir)
+
+    def _checkpoint(self, stage, **extra):
+        payload = {"stage": stage, "card_cid": CID, "size_bytes": DISK_BYTES,
+                   "handoff": handoff(), "reserve_device": RESERVE,
+                   "reserve_type": tf_card.RESERVE_CONNECTED,
+                   "android_parts": native_parts(tf_card.RESERVE_CONNECTED)[1:],
+                   "linux_fs_uuid": RESERVE_FS_UUID if stage == "validated" else LINUX_FS_UUID}
+        payload.update(extra)
+        tf_state.write_checkpoint(self.checkpoint_dir, CID, payload)
+
+    def _card(self):
+        return self._inspector().inspect_cards()["cards"][0]
+
+    def test_a_validated_intended_uuid_resumes_the_formatted_reserve(self):
+        self._checkpoint("validated", intended_fs_uuid=LINUX_FS_UUID)
+        inspector = self._inspector()
+        card = inspector.inspect_cards()["cards"][0]
+        self.assertEqual((card["state"], card["reason"]), ("recovery", ""))
+        snapshot = inspector.snapshot(DISK)
+        self.assertEqual((snapshot["mode"], snapshot["recovery"]), ("mount", True))
+        self.assertEqual(snapshot["filesystem_uuid"], LINUX_FS_UUID)
+        self.assertEqual(self.runner.ran("sgdisk", "mkfs.ext4"), [])
+
+    def test_a_validated_record_without_an_intended_uuid_stays_blocked(self):
+        self._checkpoint("validated")
+        card = self._card()
+        self.assertEqual((card["state"], card["reason"]), ("blocked", "marker_missing"))
+
+    def test_a_mismatched_intended_uuid_stays_blocked(self):
+        self._checkpoint("validated", intended_fs_uuid="11111111-2222-3333-4444-555555555555")
+        card = self._card()
+        self.assertEqual((card["state"], card["reason"]), ("blocked", "marker_missing"))
+
+    def test_a_formatted_checkpoint_still_resumes_a_markerless_reserve(self):
+        self._checkpoint("formatted")
+        inspector = self._inspector()
+        self.assertEqual(inspector.inspect_cards()["cards"][0]["state"], "recovery")
+        snapshot = inspector.snapshot(DISK)
+        self.assertEqual((snapshot["mode"], snapshot["recovery"]), ("mount", True))
+        self.assertEqual(self.runner.ran("sgdisk", "mkfs.ext4"), [])
+
+
+class Ext4RecoveryProbeTests(unittest.TestCase):
+    """The journal probe reads real superblock bytes, without mounting."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+
+    def _device(self, name="superblock.img", magic=0xEF53, incompat=0x0, size=2048):
+        path = self.root / name
+        block = bytearray(size)
+        base = tf_inspection.EXT4_SUPER_OFFSET
+        if size >= base + tf_inspection.EXT4_INCOMPAT_OFFSET + 4:
+            struct.pack_into("<H", block, base + tf_inspection.EXT4_SUPER_MAGIC_OFFSET, magic)
+            struct.pack_into("<I", block, base + tf_inspection.EXT4_INCOMPAT_OFFSET, incompat)
+        path.write_bytes(bytes(block))
+        return path
+
+    def _assert_inspection_failed(self, path):
+        with self.assertRaises(tf_inspection.InspectorError) as caught:
+            tf_inspection._ext4_needs_recovery(str(path))
+        self.assertEqual(caught.exception.code, "inspection_failed")
+
+    def test_a_clean_ext4_superblock_does_not_need_recovery(self):
+        self.assertFalse(tf_inspection._ext4_needs_recovery(str(self._device())))
+
+    def test_the_recover_flag_needs_recovery(self):
+        self.assertTrue(tf_inspection._ext4_needs_recovery(
+            str(self._device(incompat=tf_inspection.EXT4_FEATURE_INCOMPAT_RECOVER))))
+
+    def test_other_incompat_flags_do_not_need_recovery(self):
+        self.assertFalse(tf_inspection._ext4_needs_recovery(
+            str(self._device(incompat=0x2 | 0x40 | 0x200))))
+
+    def test_a_foreign_magic_is_inspection_failed(self):
+        self._assert_inspection_failed(self._device(magic=0x1234))
+
+    def test_a_truncated_superblock_is_inspection_failed(self):
+        self._assert_inspection_failed(self._device(size=tf_inspection.EXT4_SUPER_OFFSET + 0x20))
+
+    def test_an_unreadable_device_is_inspection_failed(self):
+        self._assert_inspection_failed(self.root / "missing.img")
+
+    def test_a_symlinked_device_is_not_followed(self):
+        link = self.root / "link.img"
+        link.symlink_to(self._device())
+        self._assert_inspection_failed(link)
 
 
 if __name__ == "__main__":

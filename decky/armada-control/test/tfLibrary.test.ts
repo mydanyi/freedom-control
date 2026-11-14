@@ -3,11 +3,13 @@ import { test } from "node:test";
 import {
   bytesToGib,
   canReviewTfCard,
+  completedRetryCard,
   confirmSpecFor,
   isReviewableCard,
   libraryComplete,
   libraryResult,
   retryConnectAllowed,
+  retryPlanMatchesCard,
   successBodyKey,
 } from "../src/tf/tf_model.ts";
 import { tfErrorText, tfPhaseKeys, tfStateKeys } from "../src/tf/tf_i18n.ts";
@@ -97,6 +99,51 @@ test("the mount-only retry never starts a fresh format plan directly", () => {
   // resolves to a format stays blocked from the direct retry path.
   assert.equal(retryConnectAllowed(plan({ mode: "mount", recovery: true })), true);
   assert.equal(retryConnectAllowed(plan({ mode: "format", recovery: true })), false);
+});
+
+test("the pending retry targets the card the completed status names, not the selection", () => {
+  const cidA = "1b2c3d4e5f60718293a4b5c6d7e8f901";
+  const cidB = "0011223344556677889900aabbccddee";
+  const cardA: TfCard = { ...connectedCard, device: "/dev/mmcblk0", card_cid: cidA };
+  const cardB: TfCard = { ...connectedCard, device: "/dev/mmcblk1", card_cid: cidB };
+  const completedB: TfStatus = { ...succeededPending, card_cid: cidB, device: "/dev/mmcblk1" };
+
+  // Card A is selected (and first), but the finished conversion ran on B.
+  assert.equal(completedRetryCard([cardA, cardB], completedB), cardB);
+  assert.equal(completedRetryCard([cardB, cardA], completedB), cardB);
+  assert.equal(completedRetryCard([cardA], completedB), null);
+
+  // The same device path under another CID is a different card.
+  const completedOnAsPath: TfStatus = { ...succeededPending, card_cid: cidB, device: "/dev/mmcblk0" };
+  assert.equal(completedRetryCard([cardA], completedOnAsPath), null);
+
+  // A blocked card is never retried even when its CID matches.
+  const blockedB: TfCard = { ...cardB, state: "blocked", reason: "boot_disk_forbidden" };
+  assert.equal(completedRetryCard([blockedB], completedB), null);
+
+  // Missing, malformed or non-completed identity never falls back to a card.
+  assert.equal(completedRetryCard([cardB], succeededPending), null);
+  assert.equal(completedRetryCard([cardB], { ...completedB, card_cid: "not-a-cid" }), null);
+  assert.equal(completedRetryCard([cardB], { ...completedB, card_cid: null }), null);
+  assert.equal(completedRetryCard([cardB], { ...running, card_cid: cidB }), null);
+  assert.equal(completedRetryCard([cardB], failed), null);
+});
+
+test("a retry plan is accepted only for the card identity that completed", () => {
+  const cidA = "1b2c3d4e5f60718293a4b5c6d7e8f901";
+  const cidB = "0011223344556677889900aabbccddee";
+  const mountB = plan({ mode: "mount", erase_scope: "none", card_cid: cidB });
+  assert.equal(retryPlanMatchesCard(mountB, cidB), true);
+  assert.equal(retryPlanMatchesCard(mountB, cidB.toUpperCase()), true);
+  // Re-prepared for another CID: the direct retry must be refused.
+  assert.equal(retryPlanMatchesCard(plan({ mode: "mount", erase_scope: "none", card_cid: cidA }), cidB), false);
+  // A format plan is never started from the non-destructive retry path.
+  assert.equal(retryPlanMatchesCard(plan({ mode: "format", card_cid: cidB }), cidB), false);
+  // No expected identity means no automatic retry.
+  assert.equal(retryPlanMatchesCard(mountB, null), false);
+  assert.equal(retryPlanMatchesCard(mountB, undefined), false);
+  assert.equal(retryPlanMatchesCard(null, cidB), false);
+  assert.equal(retryPlanMatchesCard(undefined, cidB), false);
 });
 
 test("only a format plan uses the destructive erase confirmation", () => {
