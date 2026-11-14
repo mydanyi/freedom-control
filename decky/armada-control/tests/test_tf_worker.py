@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "py_modules"))
 
-from armada_control.tf_library import service, tf_card, tf_state, tf_worker  # noqa: E402
+from armada_control.tf_library import service, tf_card, tf_inspection, tf_state, tf_worker  # noqa: E402
 
 MIB = 1024 * 1024
 DISK, RESERVE, META, PRIVATE = "/dev/mmcblk0", "/dev/mmcblk0p1", "/dev/mmcblk0p2", "/dev/mmcblk0p3"
@@ -327,6 +327,52 @@ class ResumeTests(WorkerTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(runner.ran("mkfs.ext4")), 1)
         self.assertEqual(self._status()["state"], "succeeded")
+
+
+class RecoveryRetryTests(WorkerTestCase):
+    """An inspector recovery plan must pass the worker's unchanged-target guard."""
+
+    def _recovery_plan(self, fs_type="vfat", fs_uuid=RESERVE_FS_UUID):
+        # p1 was retyped to Linux but the original FAT volume is still there.
+        self.runner.table = table(tf_card.RESERVE_CONNECTED)
+        self.runner.children = WorkerRunner._children(tf_card.RESERVE_CONNECTED)
+        self.runner.blkid_values = {"UUID": fs_uuid, "TYPE": fs_type}
+        tf_state.write_checkpoint(self.checkpoint, CID, {
+            "stage": "validated", "card_cid": CID, "size_bytes": DISK_BYTES, "handoff": handoff(),
+            "reserve_device": RESERVE, "reserve_type": tf_card.RESERVE_CONNECTED,
+            "android_parts": native_parts(tf_card.RESERVE_CONNECTED)[1:],
+            "linux_fs_uuid": fs_uuid})
+        inspector = tf_inspection.TfInspector(runner=self.runner, sysfs_dir=self.sysfs,
+                                              runtime_dir=self.runtime,
+                                              checkpoint_dir=self.checkpoint)
+        card = inspector.inspect_cards()["cards"][0]
+        self.assertEqual((card["state"], card["reason"]), ("recovery", ""))
+        return inspector.snapshot(DISK)
+
+    def test_a_retyped_reserve_with_its_original_fat_uuid_is_converted_once(self):
+        plan = self._recovery_plan()
+        self.assertEqual((plan["filesystem_uuid"], plan["filesystem_type"]),
+                         (RESERVE_FS_UUID, "vfat"))
+        code = self._worker(plan).run()
+        self.assertEqual(code, 0)
+        self.assertEqual(self._status()["state"], "succeeded")
+        mkfs = self.runner.ran("mkfs.ext4")
+        self.assertEqual(len(mkfs), 1)
+        self.assertEqual(mkfs[0][-1], RESERVE)
+        self.assertEqual(self.runner.ran("sgdisk"), [["sgdisk", "--typecode=1:8300", DISK]])
+        for call in self.runner.calls:
+            self.assertNotIn(META, call)
+            self.assertNotIn(PRIVATE, call)
+        record = tf_state.read_checkpoint(self.checkpoint, CID)
+        self.assertEqual((record["stage"], record["linux_fs_uuid"]), ("formatted", NEW_FS_UUID))
+
+    def test_a_changed_fat_uuid_is_still_refused_before_any_write(self):
+        plan = self._recovery_plan()
+        self.runner.blkid_values = {"UUID": "1234-5678", "TYPE": "vfat"}
+        code = self._worker(plan).run()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.runner.ran("umount", "sgdisk", "mkfs.ext4"), [])
+        self.assertIn("target_changed", self._status()["detail"])
 
 
 class RefusalTests(WorkerTestCase):

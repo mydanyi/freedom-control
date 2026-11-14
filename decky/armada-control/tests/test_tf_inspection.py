@@ -135,6 +135,56 @@ class TfRunner:
         return [call for call in self.calls if call[0] in commands]
 
 
+def _probe_stat(path, *args, **kwargs):
+    if str(path) == DISK:
+        return SimpleNamespace(st_rdev=os.makedev(*DISK_MAJMIN))
+    return _REAL_STAT(path, *args, **kwargs)
+
+
+def _marker_probe(relative, kind, connected):
+    """Child-process entry for the blocking-marker reproduction.
+
+    Runs in its own interpreter under a hard parent timeout so a marker read
+    that blocks before the bounded read can never freeze the test run.  It only
+    prints JSON: the parent decides whether the refusal was prompt and inert.
+    """
+    connected = connected == "1"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        device = root / "sys" / "class" / "block" / "mmcblk0" / "device"
+        device.mkdir(parents=True, exist_ok=True)
+        (device / "type").write_text("SD\n", encoding="utf-8")
+        (device / "cid").write_text(CID + "\n", encoding="utf-8")
+        runtime = root / "run" / "armada-installer-tf"
+        mount = root / "mnt"
+        mount.mkdir()
+        marker = mount / relative
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        if kind == "fifo":
+            os.mkfifo(marker)
+        else:
+            marker.mkdir()
+        runner = TfRunner()
+        if connected:
+            runner.table = table(tf_card.RESERVE_CONNECTED)
+            runner.children = TfRunner._children(tf_card.RESERVE_CONNECTED)
+            runner.blkid_values = {"UUID": LINUX_FS_UUID, "TYPE": "ext4"}
+        runner.mounts = [{"source": RESERVE, "target": str(mount)}]
+        with patch.object(pathlib.Path, "is_block_device", lambda self: True), \
+                patch.object(pathlib.Path, "is_mount", lambda self: False), \
+                patch.object(tf_inspection.service.os, "stat", _probe_stat):
+            inspector = tf_inspection.TfInspector(runner=runner, sysfs_dir=root / "sys",
+                                                  runtime_dir=runtime,
+                                                  checkpoint_dir=root / "checkpoints")
+            try:
+                card = inspector.inspect_cards()["cards"][0]
+            except Exception as error:  # report every escape, never retry
+                card = {"state": "raised", "reason": getattr(error, "code", type(error).__name__),
+                        "detail": str(error)}
+        sys.stdout.write(json.dumps({"card": card,
+                                     "commands": [call[0] for call in runner.calls]}))
+
+
 class InspectionTestCase(unittest.TestCase):
     reserve_type = tf_card.RESERVE_PENDING
 
@@ -300,6 +350,40 @@ class MarkerTests(InspectionTestCase):
         self.assertIn("logs", detail)
 
 
+class BlockingMarkerTests(unittest.TestCase):
+    """Non-regular markers must be refused at once, never block or be read."""
+
+    TIMEOUT = 15
+
+    def _probe(self, relative, kind, connected=False):
+        script = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                  "import test_tf_inspection as probe; probe._marker_probe(*sys.argv[2:])")
+        done = subprocess.run([sys.executable, "-c", script,
+                               str(pathlib.Path(__file__).resolve().parent),
+                               relative, kind, "1" if connected else "0"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              timeout=self.TIMEOUT)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout)
+
+    def _assert_prompt_refusal(self, result):
+        self.assertEqual((result["card"]["state"], result["card"]["reason"]),
+                         ("blocked", "handoff_invalid"))
+        self.assertEqual(result["card"]["detail"], "the handoff descriptor is not a regular file")
+        for command in ("mount", "umount", "sgdisk", "mkfs.ext4", "partprobe", "wipefs", "dd"):
+            self.assertNotIn(command, result["commands"])
+
+    def test_a_fifo_android_handoff_fails_promptly_without_a_writer(self):
+        self._assert_prompt_refusal(self._probe(tf_inspection.ANDROID_HANDOFF_RELATIVE, "fifo"))
+
+    def test_a_fifo_linux_marker_fails_promptly_without_a_writer(self):
+        self._assert_prompt_refusal(
+            self._probe(tf_inspection.LINUX_MARKER_NAME, "fifo", connected=True))
+
+    def test_a_directory_marker_is_refused(self):
+        self._assert_prompt_refusal(self._probe(tf_inspection.ANDROID_HANDOFF_RELATIVE, "dir"))
+
+
 class SnapshotTests(InspectionTestCase):
     def test_pending_snapshot_is_readonly_and_unmounts(self):
         self._write_marker(self.runtime / "inspect" / CID, tf_inspection.ANDROID_HANDOFF_RELATIVE, handoff())
@@ -384,7 +468,47 @@ class SnapshotTests(InspectionTestCase):
         self.assertEqual((card["state"], card["reason"]), ("recovery", ""))
         snapshot = inspector.snapshot(DISK)
         self.assertEqual((snapshot["mode"], snapshot["recovery"]), ("format", True))
+        # The retyped p1 still carries its original FAT volume; the recovery
+        # plan must hand that live signature on, not a blank placeholder.
+        self.assertEqual((snapshot["filesystem_uuid"], snapshot["filesystem_type"]),
+                         ("DEAD-BEEF", "vfat"))
         self.assertEqual(self.runner.ran("mount", "sgdisk", "mkfs.ext4"), [])
+
+    def test_recovery_plan_retains_the_live_fat_signature(self):
+        self.runner.table = table(tf_card.RESERVE_CONNECTED)
+        self.runner.children = TfRunner._children(tf_card.RESERVE_CONNECTED)
+        for fstype in ("vfat", "exfat"):
+            with self.subTest(fstype=fstype):
+                self.runner.blkid_values = {"UUID": RESERVE_FS_UUID, "TYPE": fstype}
+                checkpoint_dir = self.root / ("checkpoints-" + fstype)
+                tf_state.write_checkpoint(checkpoint_dir, CID, {
+                    "stage": "validated", "card_cid": CID, "size_bytes": DISK_BYTES,
+                    "handoff": handoff(), "reserve_device": RESERVE,
+                    "reserve_type": tf_card.RESERVE_CONNECTED,
+                    "android_parts": native_parts(tf_card.RESERVE_CONNECTED)[1:],
+                    "linux_fs_uuid": RESERVE_FS_UUID})
+                inspector = tf_inspection.TfInspector(runner=self.runner, sysfs_dir=self.sysfs,
+                                                      runtime_dir=self.runtime,
+                                                      checkpoint_dir=checkpoint_dir)
+                self.assertEqual(inspector.inspect_cards()["cards"][0]["state"], "recovery")
+                snapshot = inspector.snapshot(DISK)
+                self.assertEqual((snapshot["filesystem_uuid"], snapshot["filesystem_type"]),
+                                 (RESERVE_FS_UUID, fstype))
+                self.assertEqual(self.runner.ran("mount", "sgdisk", "mkfs.ext4"), [])
+
+    def test_a_blank_signature_recovery_plan_stays_none(self):
+        self.runner.table = table(tf_card.RESERVE_CONNECTED)
+        self.runner.children = TfRunner._children(tf_card.RESERVE_CONNECTED)
+        self.runner.blkid_values = {}
+        checkpoint_dir = self.root / "checkpoints"
+        tf_state.write_checkpoint(checkpoint_dir, CID, {
+            "stage": "validated", "card_cid": CID, "size_bytes": DISK_BYTES, "handoff": handoff(),
+            "reserve_device": RESERVE, "reserve_type": tf_card.RESERVE_CONNECTED,
+            "android_parts": native_parts(tf_card.RESERVE_CONNECTED)[1:], "linux_fs_uuid": None})
+        inspector = tf_inspection.TfInspector(runner=self.runner, sysfs_dir=self.sysfs,
+                                              runtime_dir=self.runtime, checkpoint_dir=checkpoint_dir)
+        snapshot = inspector.snapshot(DISK)
+        self.assertEqual((snapshot["filesystem_uuid"], snapshot["filesystem_type"]), (None, None))
 
     def test_an_unrecoverable_connected_reserve_stays_blocked(self):
         self.runner.table = table(tf_card.RESERVE_CONNECTED)

@@ -13,6 +13,7 @@ built into the read paths and cannot be disabled through the public API.
 import json
 import os
 import re
+import stat
 import subprocess
 import threading
 from pathlib import Path
@@ -116,8 +117,10 @@ def _read_marker(mountroot, relative):
     """Read a bounded, symlink-free JSON marker inside ``mountroot``.
 
     The resolved target must stay inside the real mount root and the final file
-    is opened ``O_NOFOLLOW``; a missing file returns ``None``.  Anything else is
-    a stable ``handoff_invalid`` failure.
+    is opened ``O_NOFOLLOW`` and ``O_NONBLOCK`` so a FIFO marker can never block
+    the caller; only a regular file is read (a FIFO, directory, device or other
+    special file is ``handoff_invalid``).  A missing file returns ``None``.
+    Anything else is a stable ``handoff_invalid`` failure.
     """
     root = Path(mountroot)
     try:
@@ -140,12 +143,15 @@ def _read_marker(mountroot, relative):
     if resolved != root_real and root_real not in resolved.parents:
         raise InspectorError("handoff_invalid", "the handoff path escapes the mount")
     try:
-        fd = os.open(str(target), os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(str(target), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW |
+                     getattr(os, "O_CLOEXEC", 0))
     except FileNotFoundError:
         return None
     except OSError as error:
         raise InspectorError("handoff_invalid", str(error)) from error
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise InspectorError("handoff_invalid", "the handoff descriptor is not a regular file")
         data = _read_bounded(fd)
     finally:
         os.close(fd)
@@ -435,7 +441,7 @@ class TfInspector:
     def _inspect_connected(self, card, table, reserve_device, cid, size):
         uuid, fstype = self._blkid(reserve_device)
         if not uuid or fstype not in EXT_FS_TYPES:
-            return self._recover_unformatted(card, table, reserve_device, cid, size)
+            return self._recover_unformatted(card, table, reserve_device, cid, size, uuid, fstype)
         with self._reserve_lock(reserve_device):
             mountpoint, owned = self._reserve_mount(reserve_device, cid)
             try:
@@ -459,7 +465,7 @@ class TfInspector:
                 "android_bytes": card["android_bytes"], "linux_bytes": card["linux_bytes"],
                 "mountpoint": card["mountpoint"], "library_path": card["library_path"]}
 
-    def _recover_unformatted(self, card, table, reserve_device, cid, size):
+    def _recover_unformatted(self, card, table, reserve_device, cid, size, uuid=None, fstype=None):
         """Resume a reserve that was retyped to Linux but never formatted.
 
         An interrupt between the ``p1`` typecode change and ``mkfs.ext4`` leaves
@@ -470,6 +476,12 @@ class TfInspector:
         format plan (with ``recovery`` set) so the caller must confirm the
         erase again, and the worker re-runs the bounded format without touching
         the Android side.
+
+        The snapshot keeps the live reserve signature that was just read
+        (``uuid``/``fstype``) instead of blanking it: a retyped ``p1`` still
+        carries the original FAT/exFAT volume, so the worker's unchanged-target
+        guard must compare against that same live signature rather than fail on
+        a ``None`` it never read.  A genuinely blank signature stays ``None``.
         """
         record = tf_state.read_checkpoint(self._checkpoint_dir, cid)
         if not isinstance(record, dict) or record.get("stage") != "validated":
@@ -485,7 +497,7 @@ class TfInspector:
         card["state"], card["mountpoint"], card["library_path"] = "recovery", None, None
         return {"mode": "format", "recovery": True, "device": card["device"], "size_bytes": size,
                 "card_cid": cid, "table": table, "reserve_device": reserve_device, "handoff": handoff,
-                "filesystem_uuid": None, "filesystem_type": None,
+                "filesystem_uuid": uuid or None, "filesystem_type": fstype or None,
                 "android_bytes": card["android_bytes"], "linux_bytes": card["linux_bytes"],
                 "mountpoint": None, "library_path": None}
 
