@@ -53,6 +53,13 @@ def atomic_write_json(path, payload, mode=0o600):
     The data is written to a temporary file in the same directory, flushed and
     fsynced, then ``os.replace``d over the destination so a reader never sees a
     partial file.  The parent directory is created ``0700`` if missing.
+
+    A successful return means the new name is durable: the parent directory is
+    reopened and fsynced so the ``os.replace`` itself is committed to disk.  If
+    that directory cannot be opened or fsynced the error propagates instead of
+    being swallowed -- a caller that must not act on a possibly-lost record
+    (the TF worker's pre-mkfs checkpoint) then aborts rather than assuming
+    durability it never got.
     """
     path = os.fspath(path)
     directory = os.path.dirname(path) or "."
@@ -71,14 +78,9 @@ def atomic_write_json(path, payload, mode=0o600):
         except OSError:
             pass
         raise
-    try:
-        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return
+    dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(dir_fd)
-    except OSError:
-        pass
     finally:
         os.close(dir_fd)
 
@@ -111,7 +113,11 @@ def read_checkpoint(checkpoint_dir, cid):
 
 
 def write_checkpoint(checkpoint_dir, cid, payload):
-    """Atomically persist ``payload`` for one card with ``0600`` permissions."""
+    """Atomically persist ``payload`` for one card with ``0600`` permissions.
+
+    ``OSError`` means the record is not proven durable and the caller must not
+    act on it.
+    """
     atomic_write_json(checkpoint_path(checkpoint_dir, cid), payload)
 
 

@@ -316,6 +316,20 @@ class LibraryStartTests(TfFacadeTestCase):
         self.assertEqual(caught.exception.code, "unknown_token")
         self.assertEqual(len(self.runner.launched()), 1)
 
+    def test_start_returns_the_full_running_status_contract(self):
+        svc = self._service()
+        plan = self._prepared(svc)
+        result = svc.start(plan["token"], confirmed=True)
+        # ``start_tf_library`` is declared as Result<TfStatus>, so a successful
+        # start must carry the library flags of a still-preparing run instead of
+        # leaving them for the client to invent.
+        for key in ("library_requested", "library_registered", "library_pending"):
+            with self.subTest(key=key):
+                self.assertIn(key, result)
+                self.assertIs(result[key], False)
+        self.assertEqual((result["state"], result["phase"], result["detail"]), ("running", "preparing", ""))
+        self.assertEqual((result["card_cid"], result["device"]), (CID, DISK))
+
     def test_start_launches_the_fixed_worker_unit(self):
         svc = self._service()
         plan = self._prepared(svc)
@@ -370,6 +384,72 @@ class LibraryStatusTests(TfFacadeTestCase):
                                    {"state": "running", "phase": "formatting", "detail": "x"})
         status = svc.status()
         self.assertEqual((status["state"], status["phase"], status["detail"]), ("running", "formatting", "x"))
+
+    def test_an_activating_unit_keeps_the_saved_run_running(self):
+        svc = self._service()
+        self.runner.unit_show = "LoadState=loaded\nActiveState=activating\nSubState=start\n"
+        tf_state.atomic_write_json(svc._status_path,
+                                   {"state": "running", "phase": "preparing", "detail": ""})
+        self.assertEqual(svc.status()["state"], "running")
+
+    def test_a_saved_run_with_a_missing_or_inactive_unit_is_interrupted(self):
+        svc = self._service()
+        units = {
+            "not-found": "LoadState=not-found\nActiveState=inactive\nSubState=dead\n",
+            "inactive": "LoadState=loaded\nActiveState=inactive\nSubState=dead\n",
+        }
+        for name, show in units.items():
+            with self.subTest(unit=name):
+                self.runner.unit_show = show
+                tf_state.atomic_write_json(svc._status_path,
+                                           {"state": "running", "phase": "mounting", "detail": ""})
+                status = svc.status()
+                self.assertEqual((status["state"], status["phase"], status["detail"]),
+                                 ("failed", "mounting", "interrupted"))
+                tf_state.atomic_write_json(svc._status_path,
+                                           {"state": "running", "phase": "", "detail": ""})
+                status = svc.status()
+                self.assertEqual((status["state"], status["phase"]), ("failed", "preparing"))
+
+    def test_a_saved_terminal_record_survives_an_idle_unit(self):
+        svc = self._service()
+        for state in ("succeeded", "failed"):
+            with self.subTest(state=state):
+                tf_state.atomic_write_json(svc._status_path,
+                                           {"state": state, "phase": "registering", "detail": "old"})
+                status = svc.status()
+                self.assertEqual((status["state"], status["phase"], status["detail"]),
+                                 (state, "registering", "old"))
+
+    def test_an_interrupted_run_can_be_prepared_and_started_again(self):
+        svc = self._service()
+        self.runner.unit_show = "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+        tf_state.atomic_write_json(svc._status_path,
+                                   {"state": "running", "phase": "formatting", "detail": ""})
+        self.assertEqual(svc.status()["state"], "failed")
+        self._write_marker(self._existing_mount(), tf_inspection.ANDROID_HANDOFF_RELATIVE, handoff())
+        plan = svc.prepare(DISK)
+        result = svc.start(plan["token"], confirmed=True)
+        self.assertEqual((result["state"], result["phase"]), ("running", "preparing"))
+        self.assertEqual(len(self.runner.launched()), 1)
+
+    def test_a_log_reset_failure_marks_a_failed_launch_not_a_running_one(self):
+        svc = self._service()
+        self._write_marker(self._existing_mount(), tf_inspection.ANDROID_HANDOFF_RELATIVE, handoff())
+        plan = svc.prepare(DISK)
+        # A directory where the worker log belongs makes the exact log reset
+        # fail; no worker can have been launched at that point.
+        svc._log_path.mkdir(parents=True)
+        with self.assertRaises(service.InstallerError) as caught:
+            svc.start(plan["token"], confirmed=True)
+        self.assertEqual(caught.exception.code, "launch_failed")
+        self.assertEqual(self.runner.launched(), [])
+        status = svc.status()
+        self.assertEqual((status["state"], status["phase"]), ("failed", "preparing"))
+        self.assertTrue(status["detail"])
+        with self.assertRaises(service.InstallerError) as reused:
+            svc.start(plan["token"], confirmed=True)
+        self.assertEqual(reused.exception.code, "unknown_token")
 
     def test_systemd_failure_overrides_a_stale_success(self):
         svc = self._service()
@@ -533,8 +613,8 @@ class LibraryIdentityTests(TfFacadeTestCase):
                 self.assertIsNone(status.get("device"))
         # A valid plan still yields nothing while the operation is idle.  The
         # running record written above must be replaced by an idle one first,
-        # because the service reports an idle unit together with a running
-        # record as running.
+        # because an idle unit with a saved running record is now reported as
+        # an interrupted failure.
         tf_state.atomic_write_json(svc._status_path,
                                    {"state": "idle", "phase": "", "detail": ""})
         tf_state.atomic_write_json(svc._plan_path, {"device": DISK, "card_cid": CID})

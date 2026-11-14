@@ -13,6 +13,7 @@ import errno
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -318,6 +319,17 @@ class BusyRunner(WorkerRunner):
         return super().__call__(argv, **kwargs)
 
 
+class FailingRequestRunner(WorkerRunner):
+    """A request that reports failure while Steam nonetheless registers."""
+
+    def __call__(self, argv, **kwargs):
+        if argv and argv[0] == "systemd-run":
+            self.calls.append(list(argv))
+            self._write_vdf()
+            return self._done(argv, 1, "", "steam request failed")
+        return super().__call__(argv, **kwargs)
+
+
 class FormatTests(WorkerTestCase):
     def test_format_retypes_only_p1_and_formats_only_the_reserve(self):
         self.runner.mounted, self.runner.mount_target = True, self.mount_dir
@@ -519,6 +531,14 @@ class SteamTests(WorkerTestCase):
         self.runner.blkid_values = {"UUID": LINUX_FS_UUID, "TYPE": "ext4"}
         return self._plan("mount")
 
+    def _write_membership(self):
+        """Record ``SteamLibrary`` in the account's own libraryfolders.vdf."""
+        path = self.home / ".local" / "share" / "Steam" / "config" / "libraryfolders.vdf"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        library = self.mount_dir / "SteamLibrary"
+        path.write_text('"libraryfolders"\n{\n  "0"\n  {\n    "path" "%s"\n  }\n}\n' % library,
+                        encoding="utf-8")
+
     def test_an_absent_steam_leaves_the_card_mounted_and_pending(self):
         self.runner.steam_running = False
         code = self._worker(self._mount_plan()).run()
@@ -553,6 +573,43 @@ class SteamTests(WorkerTestCase):
         self.assertTrue(status["library_requested"])
         self.assertTrue(status["library_registered"])
         self.assertFalse(status["library_pending"])
+
+    def test_a_listed_library_is_registered_even_while_steam_is_stopped(self):
+        self._write_membership()
+        self.runner.steam_running = False
+        code = self._worker(self._mount_plan()).run()
+        self.assertEqual(code, 0)
+        status = self._status()
+        self.assertEqual(status["state"], "succeeded")
+        self.assertTrue(status["library_registered"])
+        self.assertFalse(status["library_pending"])
+        self.assertFalse(status["library_requested"])
+        self.assertEqual(self.runner.ran("systemd-run"), [])
+
+    def test_a_running_steam_is_not_asked_to_add_a_listed_library(self):
+        self._write_membership()
+        self.runner.steam_running = True
+        code = self._worker(self._mount_plan()).run()
+        self.assertEqual(code, 0)
+        status = self._status()
+        self.assertTrue(status["library_registered"])
+        self.assertFalse(status["library_pending"])
+        self.assertFalse(status["library_requested"])
+        self.assertEqual(self.runner.ran("systemd-run"), [])
+
+    def test_a_failed_request_with_confirmed_membership_is_registered(self):
+        runner = self._card_runner(FailingRequestRunner())
+        runner.steam_running = True
+        runner.table = table(tf_card.RESERVE_CONNECTED)
+        runner.children = WorkerRunner._children(tf_card.RESERVE_CONNECTED)
+        runner.blkid_values = {"UUID": LINUX_FS_UUID, "TYPE": "ext4"}
+        code = self._worker(self._plan("mount"), runner=runner).run()
+        self.assertEqual(code, 0)
+        status = self._status()
+        self.assertFalse(status["library_requested"])
+        self.assertTrue(status["library_registered"])
+        self.assertFalse(status["library_pending"])
+        self.assertEqual(len(runner.ran("systemd-run")), 1)
 
 
 class IntendedUuidTests(WorkerTestCase):
@@ -656,6 +713,53 @@ class IntendedUuidTests(WorkerTestCase):
         self.assertEqual(code, 1)
         self.assertEqual(self.runner.ran("sgdisk", "mkfs.ext4"), [])
         self.assertIn("target_changed", self._status()["detail"])
+
+
+class CheckpointDurabilityTests(WorkerTestCase):
+    """An unprovable checkpoint must stop the destructive path before any write.
+
+    The failure is injected at the real filesystem boundary: only the parent
+    directory fsync of the *checkpoint* directory fails, exactly the point where
+    the record's rename may not be durable yet.  The runtime status directory is
+    left working, so the failure is scoped to the checkpoint and the worker's
+    best-effort status policy is unchanged.
+    """
+
+    def _failing_checkpoint_directory_fsync(self):
+        self.checkpoint.mkdir(parents=True, exist_ok=True)
+        info = os.stat(self.checkpoint)
+        wanted = (info.st_dev, info.st_ino)
+        real = os.fsync
+
+        def failing(fd):
+            current = os.fstat(fd)
+            if stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == wanted:
+                raise OSError(errno.EIO, "the checkpoint directory fsync failed")
+            return real(fd)
+
+        return failing
+
+    def test_a_checkpoint_durability_failure_stops_before_every_destructive_step(self):
+        # The reserve is mounted, so the only umount the worker would issue is
+        # its own, after the validated checkpoint: it must never happen.
+        self.runner.mounted, self.runner.mount_target = True, self.mount_dir
+        with patch.object(tf_state.os, "fsync", self._failing_checkpoint_directory_fsync()):
+            code = self._worker(self._plan("format")).run()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.runner.ran("umount", "partprobe", "sgdisk", "mkfs.ext4",
+                                         tf_worker.AUTOMOUNT_HELPER), [])
+        for call in self.runner.calls:
+            self.assertNotIn(META, call)
+            self.assertNotIn(PRIVATE, call)
+        self.assertFalse((self.mount_dir / tf_worker.MARKER_NAME).exists())
+        self.assertFalse((self.mount_dir / tf_worker.LIBRARY_NAME).exists())
+        self.assertEqual(self.runner.ran("systemd-run"), [])
+        self.assertIn("internal_error", self._status()["detail"])
+        # The intended record was never marked formatted, so a retry still
+        # proves its own mkfs before touching anything.
+        record = tf_state.read_checkpoint(self.checkpoint, CID)
+        self.assertEqual(record["stage"], "validated")
+        self.assertEqual(record["intended_fs_uuid"], NEW_FS_UUID)
 
 
 class LibraryOwnershipTests(WorkerTestCase):

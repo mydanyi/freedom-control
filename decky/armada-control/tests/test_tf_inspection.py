@@ -7,6 +7,7 @@ runner and the physical ``stat``/``is_block_device`` probes are injected, so the
 real code still decides and the public API never gets a bypass flag.
 """
 
+import errno
 import fcntl
 import json
 import os
@@ -25,8 +26,17 @@ from armada_control.tf_library import tf_card, tf_inspection, tf_state  # noqa: 
 
 MIB = 1024 * 1024
 DISK, RESERVE, META, PRIVATE = "/dev/mmcblk0", "/dev/mmcblk0p1", "/dev/mmcblk0p2", "/dev/mmcblk0p3"
+SECOND_DISK = "/dev/mmcblk1"
+SECOND_RESERVE = "/dev/mmcblk1p1"
+SECOND_META = "/dev/mmcblk1p2"
+SECOND_PRIVATE = "/dev/mmcblk1p3"
 CID = "1b2c3d4e5f60718293a4b5c6d7e8f901"
 CID_OTHER = "0011223344556677889900aabbccddee"
+SECOND_CID = "ffeeddccbbaa99887766554433221100"
+SECOND_RESERVE_PARTUUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+SECOND_META_PARTUUID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+SECOND_PRIVATE_PARTUUID = "cccccccc-dddd-eeee-ffff-000000000000"
+SECOND_FS_UUID = "5E6F-7A8B"
 DISK_BYTES = 512 * MIB
 SECTOR = 512
 FIRST_LBA, LAST_LBA = 2048, DISK_BYTES // SECTOR - 34
@@ -60,6 +70,16 @@ def table(reserve_type=tf_card.RESERVE_PENDING, parts=None):
     return {"label": "gpt", "sectorsize": SECTOR, "firstlba": FIRST_LBA, "lastlba": LAST_LBA,
             "id": DISK_GUID, "device": DISK,
             "partitions": parts if parts is not None else native_parts(reserve_type)}
+
+
+def foreign_parts():
+    """A second, healthy card's native layout, distinct only in identity."""
+    parts = native_parts(tf_card.RESERVE_PENDING)
+    for part, node, uuid in zip(parts, (SECOND_RESERVE, SECOND_META, SECOND_PRIVATE),
+                                (SECOND_RESERVE_PARTUUID, SECOND_META_PARTUUID,
+                                 SECOND_PRIVATE_PARTUUID)):
+        part["node"], part["uuid"] = node, uuid
+    return parts
 
 
 def handoff(**overrides):
@@ -134,6 +154,52 @@ class TfRunner:
 
     def ran(self, *commands):
         return [call for call in self.calls if call[0] in commands]
+
+
+class TwoCardRunner(TfRunner):
+    """A scan that finds a broken ``mmcblk0`` and a healthy ``mmcblk1``.
+
+    ``mmcblk0`` reaches its read-only inspection mount, which never returns
+    (``subprocess.TimeoutExpired``); ``mmcblk1`` answers every probe normally so
+    the scan must still report it as actionable.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.disks = [self.disks[0],
+                      {"name": "mmcblk1", "path": SECOND_DISK, "type": "disk",
+                       "size": DISK_BYTES, "partuuid": None, "pkname": None}]
+        parts = foreign_parts()
+        self.second_children = [{"name": part["node"].rsplit("/", 1)[-1], "path": part["node"],
+                                 "type": "part", "size": part["size"] * SECTOR,
+                                 "partuuid": part["uuid"], "pkname": "mmcblk1"} for part in parts]
+        self.second_table = {"label": "gpt", "sectorsize": SECTOR, "firstlba": FIRST_LBA,
+                             "lastlba": LAST_LBA, "id": DISK_GUID, "device": SECOND_DISK,
+                             "partitions": parts}
+
+    def __call__(self, argv, **kwargs):
+        command = argv[0] if argv else ""
+        if command == "lsblk" and SECOND_DISK in argv:
+            self.calls.append(list(argv))
+            top = {"name": "mmcblk1", "path": SECOND_DISK, "type": "disk", "size": DISK_BYTES,
+                   "partuuid": None, "pkname": None, "children": self.second_children}
+            return self._done(argv, 0, json.dumps({"blockdevices": [top]}))
+        if command == "sfdisk" and argv[-1] == SECOND_DISK:
+            self.calls.append(list(argv))
+            return self._done(argv, 0, json.dumps({"partitiontable": self.second_table}))
+        if command == "blkid" and argv[-1] == SECOND_RESERVE:
+            self.calls.append(list(argv))
+            return self._done(argv, 0, "UUID=%s\nTYPE=vfat\n" % SECOND_FS_UUID)
+        if command == "mount" and argv[-2] == SECOND_RESERVE:
+            self.calls.append(list(argv))
+            return self._done(argv, 0)
+        if command == "mount":
+            self.calls.append(list(argv))
+            raise subprocess.TimeoutExpired(argv, 30)
+        if command == "umount":
+            self.calls.append(list(argv))
+            return self._done(argv, 0)
+        return super().__call__(argv, **kwargs)
 
 
 def _probe_stat(path, *args, **kwargs):
@@ -526,6 +592,67 @@ class SnapshotTests(InspectionTestCase):
         self.runner.blkid_values = {"UUID": "DEAD-BEEF", "TYPE": "vfat"}
         card = self._inspector().inspect_cards()["cards"][0]
         self.assertEqual((card["state"], card["reason"]), ("blocked", "reserve_unprepared"))
+
+
+class MultiCardContainmentTests(InspectionTestCase):
+    """One unreadable card must never hide another card in the same scan."""
+
+    def setUp(self):
+        super().setUp()
+        self.runner = TwoCardRunner()
+        device = self.sysfs / "class" / "block" / "mmcblk1" / "device"
+        device.mkdir(parents=True, exist_ok=True)
+        (device / "type").write_text("SD\n", encoding="utf-8")
+        (device / "cid").write_text(SECOND_CID + "\n", encoding="utf-8")
+        self._write_marker(self.runtime / "inspect" / SECOND_CID,
+                           tf_inspection.ANDROID_HANDOFF_RELATIVE,
+                           handoff(card_cid=SECOND_CID, public_fs_uuid=SECOND_FS_UUID,
+                                   public_partition_guid=SECOND_RESERVE_PARTUUID,
+                                   private_partition_guid=SECOND_PRIVATE_PARTUUID))
+
+    def _stat(self, path, *args, **kwargs):
+        if str(path) in (DISK, SECOND_DISK):
+            return SimpleNamespace(st_rdev=os.makedev(179, 0 if str(path) == DISK else 1))
+        return _REAL_STAT(path, *args, **kwargs)
+
+    def test_a_mount_timeout_on_one_card_still_reports_the_healthy_card(self):
+        cards = self._inspector().inspect_cards()["cards"]
+        self.assertEqual([card["device"] for card in cards], [DISK, SECOND_DISK])
+        self.assertEqual((cards[0]["state"], cards[0]["reason"]), ("blocked", "inspection_failed"))
+        self.assertEqual((cards[1]["state"], cards[1]["reason"]), ("pending", ""))
+        snapshot = self._inspector().snapshot(SECOND_DISK)
+        self.assertEqual((snapshot["mode"], snapshot["device"]), ("format", SECOND_DISK))
+        self.assertEqual(snapshot["reserve_device"], SECOND_RESERVE)
+
+    def test_a_scan_never_issues_a_destructive_command(self):
+        self._inspector().inspect_cards()
+        self.assertEqual(self.runner.ran("sgdisk", "mkfs.ext4", "partprobe", "wipefs",
+                                         "blkdiscard", "dd"), [])
+
+
+class MarkerReadContainmentTests(InspectionTestCase):
+    """A read error is a per-card refusal that still releases the mount."""
+
+    def test_a_marker_read_error_is_contained_and_the_mount_is_released(self):
+        # The marker must exist for the read to be attempted at all: a missing
+        # marker returns None before _read_bounded and would be handoff_missing.
+        # It lives inside the owned inspection mount, so the EIO really comes
+        # from the byte read and the unmount below stays meaningful.
+        self._write_marker(self.runtime / "inspect" / CID,
+                           tf_inspection.ANDROID_HANDOFF_RELATIVE, handoff())
+        reads = []
+
+        def unreadable(fd):
+            reads.append(fd)
+            raise OSError(errno.EIO, "the marker read failed")
+
+        self._patch(tf_inspection, "_read_bounded", unreadable)
+        card = self._inspector().inspect_cards()["cards"][0]
+        self.assertEqual((card["state"], card["reason"]), ("blocked", "inspection_failed"))
+        self.assertEqual(len(reads), 1)
+        self.assertEqual([call[-1] for call in self.runner.ran("umount")],
+                         [str(self.runtime / "inspect" / CID)])
+        self.assertEqual(self.runner.ran("sgdisk", "mkfs.ext4", "wipefs", "dd"), [])
 
 
 class InspectionMountTests(InspectionTestCase):

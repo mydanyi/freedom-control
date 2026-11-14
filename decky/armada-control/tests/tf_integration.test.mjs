@@ -57,7 +57,20 @@ const backend = await import(backendUrl);
 
 const okInspection = { ok: true, data: { cards: [{ device: "/dev/mmcblk0", state: "pending" }] } };
 const failedPlan = { ok: false, error: "card_busy", detail: "the card is busy" };
-const okStatus = { ok: true, data: { state: "running", phase: "preparing", detail: "", log_tail: "" } };
+const okStatus = {
+  ok: true,
+  data: {
+    state: "running",
+    phase: "preparing",
+    detail: "",
+    log_tail: "",
+    // The service reports the full TfStatus on a successful start, so the stub
+    // mirrors that contract instead of a partial running record.
+    library_requested: false,
+    library_registered: false,
+    library_pending: false,
+  },
+};
 
 globalThis.__tfOutcome = (name) => (name === "prepare_tf_library" ? failedPlan : okInspection);
 // A success envelope and an expected failure envelope both reach the caller
@@ -268,5 +281,349 @@ for (const [controllerLocale, expected] of [
   );
 }
 assert.notEqual(tfI18n.translate("zh", "tf.title"), tfI18n.translate("en", "tf.title"));
+
+// ---------------------------------------------------------------------------
+// TF page: overlapping card scans (request generations)
+// ---------------------------------------------------------------------------
+
+// The real TfLibraryContent is transpiled and driven by a page-specific hook
+// scheduler: state, refs, memoised callbacks and effects with cleanup in hook
+// order, effects flushed right after each render, and every state write
+// scheduling the next render as a microtask. Nothing else of React is emulated.
+const pageHookRuntimeUrl = toModuleUrl(`
+  const runtime = () => globalThis.__tfPageRuntime;
+  const same = (left, right) =>
+    !!left && !!right && left.length === right.length &&
+    left.every((value, index) => Object.is(value, right[index]));
+  export function useState(initial) {
+    const rt = runtime();
+    const index = rt.cursor++;
+    if (index >= rt.hooks.length) {
+      rt.hooks.push({ kind: "state", value: typeof initial === "function" ? initial() : initial });
+    }
+    const slot = rt.hooks[index];
+    const set = (next) => {
+      const value = typeof next === "function" ? next(slot.value) : next;
+      if (Object.is(value, slot.value)) return;
+      slot.value = value;
+      rt.schedule();
+    };
+    return [slot.value, set];
+  }
+  export function useRef(initial) {
+    const rt = runtime();
+    const index = rt.cursor++;
+    if (index >= rt.hooks.length) rt.hooks.push({ kind: "ref", ref: { current: initial } });
+    return rt.hooks[index].ref;
+  }
+  export function useCallback(fn, deps) {
+    const rt = runtime();
+    const index = rt.cursor++;
+    if (index >= rt.hooks.length) rt.hooks.push({ kind: "callback", value: fn, deps });
+    const slot = rt.hooks[index];
+    if (!deps || !slot.deps || !same(deps, slot.deps)) {
+      slot.value = fn;
+      slot.deps = deps;
+    }
+    return slot.value;
+  }
+  export function useMemo(fn, deps) {
+    const rt = runtime();
+    const index = rt.cursor++;
+    if (index >= rt.hooks.length) rt.hooks.push({ kind: "memo", value: fn(), deps });
+    const slot = rt.hooks[index];
+    if (!deps || !slot.deps || !same(deps, slot.deps)) {
+      slot.value = fn();
+      slot.deps = deps;
+    }
+    return slot.value;
+  }
+  export function useEffect(effect, deps) {
+    const rt = runtime();
+    const index = rt.cursor++;
+    if (index >= rt.hooks.length) {
+      rt.hooks.push({ kind: "effect", effect, deps: undefined, cleanup: undefined });
+    }
+    const slot = rt.hooks[index];
+    slot.effect = effect;
+    if (!deps || !slot.deps || !same(deps, slot.deps)) {
+      slot.deps = deps;
+      rt.effects.push(slot);
+    }
+  }
+`, "page-hooks.js");
+
+const pageJsxStub = `export const Fragment = "Fragment";
+export const jsx = (type, props) => ({ type, props: props || {} });
+export const jsxs = jsx;
+export const jsxDEV = jsx;`;
+
+const pageUiStub = `export const ButtonItem = "ButtonItem";
+export const ConfirmModal = "ConfirmModal";
+export const DropdownItem = "DropdownItem";
+export const Field = "Field";
+export const PanelSection = "PanelSection";
+export const PanelSectionRow = "PanelSectionRow";
+export const ProgressBarItem = "ProgressBarItem";
+export const ToggleField = "ToggleField";
+export const showModal = () => {};`;
+
+// The page's backend calls become deferreds the test settles by hand, so two
+// scans can overlap in exactly the order the assertion needs.
+const pageBackendStub = `export const getTfInspection = () => globalThis.__tfPage.nextInspection();
+export const getTfStatus = () => globalThis.__tfPage.nextStatus();
+export const prepareTfLibrary = (device) => globalThis.__tfPage.prepare(device);
+export const startTfLibrary = (token, confirmed) => globalThis.__tfPage.start(token, confirmed);`;
+
+// The real localiser and the real decision helpers, as the page imports them.
+const pageTfI18nUrl = asDataUrl(
+  transpile(await readSource("../src/tf/tf_i18n.ts"), "tf_i18n.ts").replace(
+    /from ["']\.\/i18n(\.ts)?["']/,
+    `from "${i18nUrl}"`,
+  ),
+);
+const pageTfModelUrl = toModuleUrl(await readSource("../src/tf/tf_model.ts"), "tf_model.ts");
+
+const pageStubUrls = {
+  "@decky/ui": asDataUrl(pageUiStub),
+  react: pageHookRuntimeUrl,
+  "react/jsx-runtime": asDataUrl(pageJsxStub),
+  "./tf_backend": asDataUrl(pageBackendStub),
+  "./tf_i18n": pageTfI18nUrl,
+  "./tf_model": pageTfModelUrl,
+  "./i18n": i18nUrl,
+  "./tf_types": asDataUrl("export {};"),
+};
+
+const pageJs = transpile(await readSource("../src/tf/TfLibraryContent.tsx"), "TfLibraryContent.tsx").replace(
+  /from ["']([^"']+)["']/g,
+  (_match, specifier) => {
+    const url = pageStubUrls[specifier];
+    if (!url) throw new Error(`TfLibraryContent.tsx imports an unstubbed module: ${specifier}`);
+    return `from "${url}"`;
+  },
+);
+const { TfLibraryContent } = await import(asDataUrl(pageJs));
+
+// Timers are stubbed so the component's status poll can never run a real
+// interval during the test; the pending entries are counted and cleared.
+const pageTimers = { next: 1, pending: new Map() };
+globalThis.window = {
+  setTimeout: (callback) => {
+    const id = pageTimers.next;
+    pageTimers.next += 1;
+    pageTimers.pending.set(id, callback);
+    return id;
+  },
+  clearTimeout: (id) => {
+    pageTimers.pending.delete(id);
+  },
+};
+
+const deferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+};
+
+const settle = async () => {
+  for (let turn = 0; turn < 3; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+};
+
+const pageCard = (device) => ({
+  device,
+  size_bytes: 512 * 1024 * 1024,
+  card_cid: "1b2c3d4e5f60718293a4b5c6d7e8f901",
+  state: "pending",
+  reason: "",
+  detail: "",
+  reserve_device: `${device}p1`,
+  android_bytes: 64 * 1024 * 1024,
+  linux_bytes: 128 * 1024 * 1024,
+  mountpoint: null,
+  library_path: null,
+});
+const cardDeviceA = "/dev/mmcblk0";
+const cardDeviceB = "/dev/mmcblk1";
+const inspectionOf = (devices) => ({ ok: true, data: { cards: devices.map(pageCard) } });
+// An idle status: the page may review, and the poll resolves without touching
+// the card list.
+const pageIdleStatus = {
+  ok: true,
+  data: {
+    state: "idle",
+    phase: "",
+    detail: "",
+    log_tail: "",
+    library_requested: false,
+    library_registered: false,
+    library_pending: false,
+  },
+};
+
+const pageCalls = { inspections: [] };
+globalThis.__tfPage = {
+  nextInspection: () => {
+    const pending = deferred();
+    pageCalls.inspections.push(pending);
+    return pending.promise;
+  },
+  nextStatus: () => Promise.resolve(pageIdleStatus),
+  // Nothing in this scenario may start a conversion; a failure envelope would
+  // surface if it ever did.
+  prepare: () => Promise.resolve({ ok: false, error: "internal_error", detail: "" }),
+  start: () => Promise.resolve({ ok: false, error: "internal_error", detail: "" }),
+};
+
+const mountTfPage = () => {
+  const runtime = {
+    hooks: [],
+    cursor: 0,
+    effects: [],
+    scheduled: false,
+    renders: 0,
+    unmounted: false,
+    afterUnmountWrites: 0,
+    tree: null,
+    component: TfLibraryContent,
+    props: { locale: "en" },
+  };
+  runtime.schedule = () => {
+    if (runtime.unmounted) {
+      // A state write after unmount is a defect: record it instead of rendering.
+      runtime.afterUnmountWrites += 1;
+      return;
+    }
+    if (runtime.scheduled) return;
+    runtime.scheduled = true;
+    Promise.resolve().then(() => {
+      runtime.scheduled = false;
+      if (!runtime.unmounted) runtime.render();
+    });
+  };
+  runtime.render = () => {
+    runtime.cursor = 0;
+    runtime.renders += 1;
+    runtime.effects = [];
+    runtime.tree = runtime.component(runtime.props);
+    const queued = runtime.effects;
+    runtime.effects = [];
+    for (const slot of queued) {
+      if (typeof slot.cleanup === "function") slot.cleanup();
+      slot.cleanup = undefined;
+      const cleanup = slot.effect();
+      slot.cleanup = typeof cleanup === "function" ? cleanup : undefined;
+    }
+  };
+  runtime.unmount = () => {
+    for (const slot of runtime.hooks) {
+      if (slot.kind === "effect" && typeof slot.cleanup === "function") {
+        slot.cleanup();
+        slot.cleanup = undefined;
+      }
+    }
+    runtime.unmounted = true;
+  };
+  globalThis.__tfPageRuntime = runtime;
+  runtime.render();
+  return runtime;
+};
+
+const tfLabel = (key) => tfI18n.translate("en", key);
+
+const pageFields = (tree) => findAll(tree, (node) => node.type === "Field").map((node) => node.props);
+
+const pageCardDevices = (tree) => {
+  const dropdown = findAll(tree, (node) => node.type === "DropdownItem")[0];
+  return dropdown ? dropdown.props.rgOptions.map((option) => option.data) : [];
+};
+
+const pageShowsLoading = (tree) => pageFields(tree).some((props) => props.label === tfLabel("common.loading"));
+
+const pageShowsErrorRow = (tree) => pageFields(tree).some((props) => props.label === tfLabel("failure.errorLabel"));
+
+const pageShowsText = (tree, key) => pageFields(tree).some((props) => props.label === tfLabel(key));
+
+const pageRescan = (tree) => {
+  const button = findAll(tree, (node) => node.type === "ButtonItem" && node.props.children === tfLabel("tf.rescan"))[0];
+  assert.ok(button, "the rendered page offers a Rescan button");
+  return button;
+};
+
+// Mount: one scan is issued and the loading row is rendered while it is open.
+let page = mountTfPage();
+assert.equal(pageCalls.inspections.length, 1, "mounting the tab scans the cards once");
+assert.ok(pageShowsLoading(page.tree), "the initial scan owns the loading row");
+
+pageCalls.inspections[0].resolve(inspectionOf([cardDeviceA]));
+await settle();
+assert.deepEqual(pageCardDevices(page.tree), [cardDeviceA]);
+assert.ok(!pageShowsLoading(page.tree), "the settled initial scan ends its loading row");
+
+// Two rescans are started through the rendered button before either settles.
+pageRescan(page.tree).props.onClick();
+await settle();
+pageRescan(page.tree).props.onClick();
+await settle();
+assert.equal(pageCalls.inspections.length, 3, "both rescans reached the backend");
+const [olderScan, newerScan] = [pageCalls.inspections[1], pageCalls.inspections[2]];
+
+// The newer scan settles first and is rendered.
+newerScan.resolve(inspectionOf([cardDeviceB]));
+await settle();
+assert.deepEqual(pageCardDevices(page.tree), [cardDeviceB], "the newest scan result is rendered");
+
+// The older scan then fails: it must neither clear those cards nor show an error.
+olderScan.resolve({ ok: false, error: "card_busy", detail: "stale failure" });
+await settle();
+assert.deepEqual(pageCardDevices(page.tree), [cardDeviceB], "an older failed scan cannot clear the newer cards");
+assert.ok(!pageShowsErrorRow(page.tree), "an older failed scan cannot surface an error row");
+
+// A newer scan may legitimately report no cards: that result is rendered.
+pageRescan(page.tree).props.onClick(); // request 4, kept pending
+await settle();
+pageRescan(page.tree).props.onClick(); // request 5, settles empty
+await settle();
+assert.equal(pageCalls.inspections.length, 5);
+const lateScan = pageCalls.inspections[3];
+pageCalls.inspections[4].resolve(inspectionOf([]));
+await settle();
+assert.deepEqual(pageCardDevices(page.tree), [], "the newest empty scan is rendered");
+assert.ok(pageShowsText(page.tree, "tf.none.title"), "the empty result shows the no-card state");
+
+// A scan started from the empty state owns the loading row; an older scan that
+// settles afterwards must not end it or bring its own cards back.
+pageRescan(page.tree).props.onClick(); // request 6, kept pending
+await settle();
+assert.equal(pageCalls.inspections.length, 6);
+assert.ok(pageShowsLoading(page.tree), "a rescan from the empty state owns the loading row");
+const currentScan = pageCalls.inspections[5];
+
+lateScan.resolve(inspectionOf([cardDeviceA]));
+await settle();
+assert.ok(pageShowsLoading(page.tree), "an older completion cannot end the newer scan loading state");
+assert.deepEqual(pageCardDevices(page.tree), [], "an older completion cannot render its cards");
+
+currentScan.resolve(inspectionOf([cardDeviceB]));
+await settle();
+assert.deepEqual(pageCardDevices(page.tree), [cardDeviceB]);
+assert.ok(!pageShowsLoading(page.tree), "the newest scan ends its own loading row");
+
+// A scan still open when the page unmounts writes nothing at all.
+pageRescan(page.tree).props.onClick();
+await settle();
+assert.equal(pageCalls.inspections.length, 7);
+assert.ok(pageTimers.pending.size > 0, "the status poll runs on the stubbed timer");
+const rendersBeforeUnmount = page.renders;
+const writesBeforeUnmount = page.afterUnmountWrites;
+page.unmount();
+assert.equal(pageTimers.pending.size, 0, "unmounting clears the stubbed poll timer");
+pageCalls.inspections[6].resolve(inspectionOf([cardDeviceA]));
+await settle();
+assert.equal(page.renders, rendersBeforeUnmount, "no render follows the unmount");
+assert.equal(page.afterUnmountWrites, writesBeforeUnmount, "a scan settling after unmount writes no state");
 
 console.log("TF integration tests passed: RPC calls/envelopes and Content tab rendering");

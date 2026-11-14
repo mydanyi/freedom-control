@@ -354,7 +354,16 @@ class TfLibraryService:
                 self._token, self._plan = None, None
                 self._write_plan(plan, seen)
                 self._write_status({"state": "running", "phase": "preparing", "detail": ""})
-                self._truncate_log()
+                try:
+                    self._truncate_log()
+                except InstallerError as error:
+                    # No worker was launched, so the provisional running record
+                    # is wrong and must not survive: record the known launch
+                    # failure before re-raising.  The token stays consumed, and
+                    # a retry therefore starts from a fresh prepare.
+                    self._write_status({"state": "failed", "phase": "preparing",
+                                        "detail": error.detail or "launch_failed"})
+                    raise
                 try:
                     result = _capture(self._runner, self._tf_argv())
                 except (OSError, subprocess.SubprocessError) as error:
@@ -364,7 +373,11 @@ class TfLibraryService:
                     detail = (result.stderr or "").strip() or "systemd-run could not start the TF library worker"
                     self._write_status({"state": "failed", "phase": "preparing", "detail": detail})
                     raise InstallerError("launch_failed", detail)
-                started = {"state": "running", "phase": "preparing", "detail": "", "log_tail": ""}
+                # The launch has not requested or registered a library yet, so
+                # the running status it returns carries those flags as false.
+                started = {"state": "running", "phase": "preparing", "detail": "", "log_tail": "",
+                           "library_requested": False, "library_registered": False,
+                           "library_pending": False}
                 # The freshly written plan names the card this run is bound to,
                 # so a retry after reopening can find that same card again.
                 identity = _plan_identity({"device": plan["device"], "card_cid": plan["card_cid"]})
@@ -377,8 +390,13 @@ class TfLibraryService:
 
         A failed unit always reports ``failed`` even when a stale status record
         still claims success; a running or successful unit likewise overrides
-        an out-of-date record.  ``phase`` is one of ``preparing``,
-        ``formatting``, ``mounting`` or ``registering`` (or empty when idle).
+        an out-of-date record.  An idle unit with a saved ``running`` record
+        means no worker exists (the launch died, or it exited before writing a
+        terminal record): that run is reported as ``failed``/interrupted so it
+        cannot look busy forever and block the user's retry.  Saved terminal
+        records are kept, and an activating/running unit is never called
+        failed.  ``phase`` is one of ``preparing``, ``formatting``,
+        ``mounting`` or ``registering`` (or empty when idle).
 
         A non-idle operation also reports the ``card_cid``/``device`` of the
         persisted plan that launched it, when that record is valid, so a
@@ -398,6 +416,21 @@ class TfLibraryService:
                     state = unit
                     if unit == "running" and phase not in tf_state.PHASES:
                         phase = "preparing"
+                elif state == "running":
+                    # The unit is idle while the record still claims a run: the
+                    # launch never produced a worker, or the worker vanished
+                    # before writing a terminal record.  Report that run as an
+                    # interrupted failure instead of leaving it running forever,
+                    # so the card can be prepared and confirmed again.  Only a
+                    # saved ``running`` record is reinterpreted; a saved
+                    # terminal record is retained, and ``_state_of`` maps an
+                    # activating/running unit to ``running`` above, so a live
+                    # worker is never labelled failed.
+                    state = "failed"
+                    if phase not in tf_state.PHASES:
+                        phase = "preparing"
+                    if not detail:
+                        detail = "interrupted"
                 if state not in tf_state.STATES:
                     state = "idle"
                     phase = ""

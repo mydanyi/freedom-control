@@ -99,19 +99,30 @@ export function TfLibraryContent({ locale }: { locale: Locale }) {
   const mounted = useRef(true);
   const actionLock = useRef(false);
   const sessionRef = useRef(0);
+  // Monotonic id of the newest card scan. Rescans overlap freely, so every
+  // result, error and loading write is gated on it: an older scan that settles
+  // last can never overwrite the cards or the loading state of a newer one.
+  const scanRef = useRef(0);
 
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      // A scan still awaiting is stale from here on, even if this component is
+      // mounted again before its promise settles.
+      scanRef.current += 1;
     };
   }, []);
 
   const loadCards = useCallback(async () => {
+    const scan = scanRef.current + 1;
+    scanRef.current = scan;
+    // The newest scan owns the loading state from the moment it starts.
+    const isCurrent = () => mounted.current && scanRef.current === scan;
     setLoading(true);
     try {
       const result = await getTfInspection();
-      if (!mounted.current) return;
+      if (!isCurrent()) return;
       if (!result.ok) {
         setCardsError({ code: result.error, detail: result.detail });
         setCards([]);
@@ -123,11 +134,11 @@ export function TfLibraryContent({ locale }: { locale: Locale }) {
       setSelectedDevice((current) =>
         next.some((card) => card.device === current) ? current : (next[0]?.device ?? null));
     } catch (error) {
-      if (!mounted.current) return;
+      if (!isCurrent()) return;
       setCardsError({ code: "inspection_failed", detail: String(error) });
       setCards([]);
     } finally {
-      if (mounted.current) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, []);
 

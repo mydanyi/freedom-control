@@ -13,8 +13,12 @@ level:
   retype only ``p1`` and leave every Android GUID, geometry and byte untouched;
 * only the reserve region is formatted, with an explicit offset and an explicit
   block count plus ``nodiscard`` (so nothing outside ``p1`` is ever written);
+* the GPT still verifies cleanly (``sgdisk --verify``), its disk GUID and
+  geometry are unchanged, and the Android entries keep their exact metadata --
+  only the ``p1`` type code legitimately differs;
 * the reserve is a real ext4 filesystem with the ``ARMADA_TF_<cid6>`` label, and
-  the Android sentinel bytes are byte-for-byte unchanged.
+  a streaming SHA256 over *every* byte of the Android ``p2``/``p3`` regions is
+  byte-for-byte unchanged.
 
 It prints a JSON proof document to stdout and exits non-zero on any difference.
 It proves image-level invariants, not behaviour on a real SD card.
@@ -45,11 +49,11 @@ RESERVE_PARTUUID = "11111111-2222-3333-4444-555555555555"
 META_PARTUUID = "22222222-3333-4444-5555-666666666666"
 PRIVATE_PARTUUID = "99999999-8888-7777-6666-555555555555"
 PRIVATE_FS_UUID = "abcdef01-2345-6789-abcd-ef0123456789"
-WINDOW = 4096
+DIGEST_CHUNK = 1024 * 1024
 
 
-def _run(argv):
-    return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def _run(argv, env=None):
+    return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
 
 
 def _sectors():
@@ -74,12 +78,23 @@ def _sfdisk(image):
     return json.loads(result.stdout)["partitiontable"]
 
 
-def _window_hash(stream, offset, size):
+def _region_digest(stream, offset, size):
+    """SHA256 over every byte of ``[offset, offset + size)``.
+
+    The whole region is streamed in bounded chunks, so a mutation anywhere
+    inside it changes the digest; nothing is sampled.  A short read means the
+    image is smaller than the layout claims, which is a hard failure instead of
+    a digest silently covering fewer bytes than promised.
+    """
     digest = hashlib.sha256()
-    for position, length in ((offset, min(WINDOW, size)),
-                             (offset + max(0, size - WINDOW), min(WINDOW, size))):
-        stream.seek(position)
-        digest.update(stream.read(length))
+    stream.seek(offset)
+    remaining = size
+    while remaining > 0:
+        block = stream.read(min(DIGEST_CHUNK, remaining))
+        if not block:
+            raise RuntimeError("premature EOF hashing %d bytes at offset %d" % (size, offset))
+        digest.update(block)
+        remaining -= len(block)
     return digest.hexdigest()
 
 
@@ -119,8 +134,8 @@ def _checks(image):
     reserve_offset = FIRST_LBA * SECTOR
     proof = []
     with image.open("rb") as stream:
-        meta_before = _window_hash(stream, meta_start * SECTOR, META_BYTES)
-        private_before = _window_hash(stream, private_start * SECTOR, private * SECTOR)
+        meta_before = _region_digest(stream, meta_start * SECTOR, META_BYTES)
+        private_before = _region_digest(stream, private_start * SECTOR, private * SECTOR)
     table_before = _sfdisk(image)
     parts_before = [_record_part(part) for part in table_before["partitions"]]
 
@@ -149,6 +164,18 @@ def _checks(image):
     table_after = _sfdisk(image)
     parts_after = [_record_part(part) for part in table_after["partitions"]]
 
+    # Only the p1 type code may differ, so the GPT headers and CRC change by
+    # design; the table itself must still verify and keep its own identity.
+    verify = _run(["sgdisk", "--verify", str(image)], env=dict(os.environ, LC_ALL="C"))
+    verify_ok = verify.returncode == 0 and "No problems found" in (verify.stdout or "")
+    proof.append({"name": "gpt_verify_clean", "ok": verify_ok,
+                  "detail": "" if verify_ok else ((verify.stdout or "") + (verify.stderr or "")).strip()})
+    geometry_keys = ("label", "sectorsize", "firstlba", "lastlba", "id")
+    geometry_unchanged = all(table_before.get(key) == table_after.get(key) for key in geometry_keys)
+    proof.append({"name": "disk_geometry_and_guid_unchanged", "ok": geometry_unchanged,
+                  "before": {key: table_before.get(key) for key in geometry_keys},
+                  "after": {key: table_after.get(key) for key in geometry_keys}})
+
     android_unchanged = parts_before[1:] == parts_after[1:]
     proof.append({"name": "android_guid_geometry_unchanged", "ok": android_unchanged,
                   "before": parts_before[1:], "after": parts_after[1:]})
@@ -159,13 +186,16 @@ def _checks(image):
     proof.append({"name": "reserve_p1_retyped_and_preserved", "ok": p1_ok, "p1": p1})
 
     with image.open("rb") as stream:
-        meta_after = _window_hash(stream, meta_start * SECTOR, META_BYTES)
-        private_after = _window_hash(stream, private_start * SECTOR, private * SECTOR)
+        meta_after = _region_digest(stream, meta_start * SECTOR, META_BYTES)
+        private_after = _region_digest(stream, private_start * SECTOR, private * SECTOR)
         stream.seek(reserve_offset + 0x438)          # ext4 superblock magic
         magic = stream.read(2)
         stream.seek(reserve_offset + 0x478)          # ext4 volume label
         written_label = stream.read(16).split(b"\x00", 1)[0].decode("ascii", "replace")
-    proof.append({"name": "android_bytes_unchanged", "ok": meta_before == meta_after and private_before == private_after})
+    proof.append({"name": "android_bytes_unchanged",
+                  "ok": meta_before == meta_after and private_before == private_after,
+                  "sha256": {"p2_before": meta_before, "p2_after": meta_after,
+                             "p3_before": private_before, "p3_after": private_after}})
     proof.append({"name": "reserve_is_ext4", "ok": magic == b"\x53\xef", "magic": magic.hex()})
     proof.append({"name": "reserve_label", "ok": written_label == label, "label": written_label})
     return proof

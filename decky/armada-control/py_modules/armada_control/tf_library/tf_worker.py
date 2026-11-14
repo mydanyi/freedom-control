@@ -20,7 +20,9 @@ conversion survives a Decky panel close or a plugin reload.  The worker:
   reserve ext4 mounted read-write, writes the Linux marker and creates the
   ``SteamLibrary/steamapps`` tree owned by UID 1000;
 * asks a running Steam to add the library folder, and reports registration
-  separately from the request (a CLI ``0`` is never treated as registration).
+  separately from the request: membership in ``libraryfolders.vdf`` is read
+  first, so an already listed library is reported registered with no request at
+  all, and a CLI ``0`` is never treated as registration.
 
 The module imports the package absolutely, adding the ``py_modules`` ancestor of
 its own file (three directories up: ``tf_library`` -> ``armada_control`` ->
@@ -455,6 +457,14 @@ class TfWorker:
     def _register(self, library):
         self._set_phase("registering", "Registering the Steam library")
         library_path = str(library)
+        # Membership in the account's own libraryfolders.vdf is the only proof
+        # of registration, so it is checked first and independently of Steam:
+        # a library that is already listed needs no request at all, and an
+        # exited Steam cannot make an already registered library pending.
+        if self._library_member(library_path):
+            self._update(library_requested=False, library_registered=True, library_pending=False,
+                         detail="")
+            return
         if not self._steam_running():
             self._update(library_requested=False, library_registered=False, library_pending=True,
                          detail="Steam is not running; the library is mounted and pending registration")
@@ -465,9 +475,9 @@ class TfWorker:
                 self._steam_bin, "-ifrunning", url]
         result = self._run(argv, check=False, timeout=STEAM_TIMEOUT)
         requested = result is not None and result.returncode == 0
-        # A CLI success only means Steam was asked; membership is confirmed by
-        # reading the account's own libraryfolders.vdf, never by an exit code.
-        registered = bool(requested and self._library_member(library_path))
+        # A CLI success only means Steam was asked; membership is re-read after
+        # the attempt and is the sole determinant of ``library_registered``.
+        registered = self._library_member(library_path)
         self._update(library_requested=requested, library_registered=registered,
                      library_pending=not registered,
                      detail="" if registered else "the library request could not be confirmed")

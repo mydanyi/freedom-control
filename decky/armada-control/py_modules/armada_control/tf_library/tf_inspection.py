@@ -400,6 +400,13 @@ class TfInspector:
         except service.InstallerError as error:
             card["reason"], card["detail"] = error.code, error.detail
             return card, None
+        except (OSError, subprocess.SubprocessError) as error:
+            # A single card whose marker read hits EIO, or whose inspection
+            # mount times out, must not abort the whole scan: contain exactly
+            # those external failures for this card and let the other cards
+            # stay inspectable.  Programming errors are still raised.
+            card["reason"], card["detail"] = "inspection_failed", str(error)
+            return card, None
 
     # -- description --------------------------------------------------------
 
@@ -678,7 +685,10 @@ class TfInspector:
         except OSError as error:
             raise InspectorError("inspection_failed", str(error)) from error
         options = "ro,noload,nodev,nosuid,noexec" if ext4 else "ro,nosuid,nodev,noexec"
-        result = service._capture(self._runner, ["mount", "-o", options, device, str(base)])
+        try:
+            result = service._capture(self._runner, ["mount", "-o", options, device, str(base)])
+        except (OSError, subprocess.SubprocessError) as error:
+            raise InspectorError("inspection_failed", str(error)) from error
         if result.returncode:
             detail = (result.stderr or "").strip() or "could not mount the reserve read-only"
             raise InspectorError("inspection_failed", detail)
